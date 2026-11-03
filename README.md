@@ -52,7 +52,7 @@ Rendering also produces an HTML report with all intermediate checks.
 
 ## Citation
 
-If you use this code, please cite the article and this repository (see [`CITATION.cff`](CITATION.cff) or the Zenodo record: https://doi.org/[CONCEPT-DOI]).
+If you use this code, please cite the article and this repository (see [`CITATION.cff`](CITATION.cff) or the Zenodo record: https://doi.org/10.5281/zenodo.23923781).
 
 ## Funding
 
