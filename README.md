@@ -22,7 +22,7 @@ The code implements:
 
 ## Data
 
-The data are **not included** in this repository. The DRG discharge data are owned by FONASA and cannot be redistributed by the authors. See [`data/README.md`](data/README.md) for the required files, their sources, and how to obtain them.
+The data are **not included** in this repository. The annual DRG discharge databases are publicly available from FONASA, and the consolidated analytic dataset can be requested from CADS, Universidad Mayor. See [`data/README.md`](data/README.md) for both options and the required files.
 
 Variable names and category labels from the source databases are in Spanish (for example, `SEXO == "MUJER"` or `TIPOALTA == "FALLECIDO"`) and are kept unchanged in the code; all comments, outputs, tables, and figures are in English.
 
