@@ -1,0 +1,2612 @@
+---
+title: "In-hospital mortality and geographical variation in COPD hospitalisations in Chile, 2019–2024: a nationwide retrospective cohort study — analysis code"
+author: "Díaz-Catalán D, Valentino G, Vidal-Vargas N, Yarza Saez MB, Peñailillo L, Vásquez-Muñoz M"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    code_folding: hide
+---
+
+This R Markdown file reproduces all analyses, tables, and figures of the manuscript, in their order of appearance, followed by the appendix material.
+
+**Inputs (not included in the repository; see `data/README.md`):** the FONASA diagnosis-related group (DRG) discharge database, the 2014 Ministry of Health (MINSAL) length-of-stay reference standard, the FONASA DRG master tables, and the population estimates and projections of the Chilean National Statistics Institute (INE). All files are read from the `data/` folder.
+
+**Outputs:** `figures/` (Figures 1–3 and Figure S1) and `tables/` (`Tables_main.docx` with Tables 1–3 and `Appendix_tables.docx` with Tables S1–S7).
+
+# Setup
+
+```{r setup, include=FALSE}
+library(knitr)
+
+# Global chunk options
+knitr::opts_chunk$set(
+  comment   = NA,
+  prompt    = TRUE,
+  tidy      = TRUE,
+  tidy.opts = list(width.cutoff = 60),
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  cache     = FALSE,
+  fig.cap   = " "
+)
+
+# Date locale
+Sys.setlocale("LC_TIME", "C")
+```
+
+```{r packages, include=FALSE, echo=FALSE, warning=FALSE}
+usePackage <- function(pkg) {
+  options(repos = c(CRAN = "https://cran.r-project.org"))
+
+  if (!pkg %in% rownames(installed.packages())) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+
+  library(pkg, character.only = TRUE)
+}
+
+# Packages to install/load
+packages <- c(
+  "tidyverse",
+  "data.table",
+  "readxl",
+  "kableExtra",
+  "tidytext",
+  "survminer",
+  "chilemapas",
+  "patchwork",
+  "viridis",
+  "UpSetR",
+  "stringi",
+  "comorbidity",
+  "forcats",
+  "gtsummary",
+  "broom",
+  "purrr",
+  "scales",
+  "pROC",
+  "splines",
+  "survival",
+  "RColorBrewer",
+  "DiagrammeR",
+  "rsvg",
+  "flextable",
+  "officer",
+  "sandwich",
+  "lmtest",
+  "quantreg",
+  "here",
+  "sf",
+  "gridExtra"
+)
+
+invisible(lapply(packages, usePackage))
+```
+
+```{r print_options}
+# Avoid global truncation in console output
+options(
+  tibble.print_max = Inf,
+  tibble.width     = Inf,
+  dplyr.print_max  = Inf,
+  width            = 200
+)
+```
+
+```{r lancet_helpers, echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+## Lancet-style number formatting -----------------------------------------
+# Mid-dot decimal point (0·75); thin space only in numbers with 5 or more digits (30 286)
+lancet_num <- function(x, digits = 1) {
+  gsub(".", "\u00B7", formatC(x, format = "f", digits = digits), fixed = TRUE)
+}
+
+lancet_int <- function(x) {
+  ifelse(abs(x) >= 10000,
+         formatC(x, format = "d", big.mark = "\u2009"),
+         formatC(x, format = "d"))
+}
+
+# p values with two significant figures, at most four decimals, or p<0·0001
+lancet_p <- function(p) {
+  out <- dplyr::case_when(
+    is.na(p)   ~ NA_character_,
+    p < 0.0001 ~ "<0.0001",
+    p < 0.001  ~ formatC(round(p, 4), format = "f", digits = 4),
+    TRUE       ~ formatC(signif(p, 2), format = "fg", digits = 2, flag = "#")
+  )
+  gsub(".", "\u00B7", out, fixed = TRUE)
+}
+
+lancet_ci <- function(est, lo, hi, digits = 2) {
+  sprintf("%s (%s\u2013%s)", lancet_num(est, digits), lancet_num(lo, digits), lancet_num(hi, digits))
+}
+
+n_pct <- function(x, n, digits = 1) {
+  sprintf("%s (%s%%)", lancet_int(x), lancet_num(100 * x / n, digits))
+}
+
+# Wilson 95% CI for proportions
+wilson_ci <- function(x, n, z = qnorm(0.975)) {
+  p      <- x / n
+  centre <- (p + z^2 / (2 * n)) / (1 + z^2 / n)
+  half   <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / (1 + z^2 / n)
+  list(lo = centre - half, hi = centre + half)
+}
+
+# "p=0·12" or "p<0·0001", as appropriate
+p_text <- function(p) {
+  x <- lancet_p(p)
+  ifelse(startsWith(x, "<"), paste0("p", x), paste0("p=", x))
+}
+
+# Median (IQR), used in Tables 1 and S4 and in the text
+iqr_fmt <- function(x) {
+  q <- round(quantile(x, c(0.25, 0.50, 0.75), na.rm = TRUE))
+  sprintf("%s (%s\u2013%s)", q[2], q[1], q[3])
+}
+```
+
+# Data and study population
+
+```{r data_import, echo=FALSE, message=FALSE, warning=FALSE}
+read_rds_safe <- function(filename) {
+  path <- here::here("data", filename)
+  stopifnot(file.exists(path))
+  readRDS(path)
+}
+
+read_excel_safe <- function(filename, sheet) {
+  path <- here::here("data", filename)
+  stopifnot(file.exists(path))
+  readxl::read_excel(path, sheet = sheet, col_names = TRUE)
+}
+
+raw_data <- read_rds_safe("consolidated_data_COPD.rds")
+minsal_df <- read_excel_safe("Norma MINSAL 2014_definitivo.xlsx", sheet = "PC IRGRD incluidos")
+
+flow_log <- tibble::tibble(
+  step        = "Initial database",
+  excluded_n  = NA_integer_,
+  remaining_n = nrow(raw_data)
+)
+
+apply_filter_step <- function(data, condition, step_label, flow_log_object) {
+  filtered_data <- data %>% dplyr::filter({{ condition }})
+  new_row <- tibble::tibble(
+    step        = step_label,
+    excluded_n  = nrow(data) - nrow(filtered_data),
+    remaining_n = nrow(filtered_data)
+  )
+  list(
+    data     = filtered_data,
+    flow_log = dplyr::bind_rows(flow_log_object, new_row)
+  )
+}
+
+# --- STEP 1: Study period (2019-2024) ---
+tmp <- apply_filter_step(
+  raw_data,
+  fecha_ingreso_dt >= lubridate::ymd("2019-01-01") &
+    fecha_ingreso_dt <= lubridate::ymd("2024-12-31"),
+  "Excluded outside study period (2019-2024)",
+  flow_log
+)
+filtered_data <- tmp$data; flow_log <- tmp$flow_log
+
+# --- STEP 2: Adults only ---
+tmp <- apply_filter_step(
+  filtered_data,
+  age >= 40,
+  "Excluded age < 40 years",
+  flow_log
+)
+filtered_data <- tmp$data; flow_log <- tmp$flow_log
+
+# --- STEP 3: Unknown province or sex ---
+tmp <- apply_filter_step(
+  filtered_data,
+  PROVINCIA != "DESCONOCIDO" & SEXO != "DESCONOCIDO",
+  "Excluded unknown province or sex",
+  flow_log
+)
+filtered_data <- tmp$data; flow_log <- tmp$flow_log
+
+rates_data <- filtered_data   # base for population rates (before the insurance and length-of-stay filters)
+
+# --- STEP 4: Valid admission type ---
+# tmp <- apply_filter_step(
+#   filtered_data,
+#   TIPO_INGRESO %in% c("URGENCIA", "PROGRAMADA"),
+#   "Excluded admission types other than emergency or scheduled",
+#   flow_log
+# )
+# filtered_data <- tmp$data; flow_log <- tmp$flow_log
+
+# --- STEP 5: Valid discharge type ---
+# tmp <- apply_filter_step(
+#   filtered_data,
+#   TIPOALTA != "NO IDENTIFICADA",
+#   "Excluded unknown discharge type",
+#   flow_log
+# )
+# filtered_data <- tmp$data; flow_log <- tmp$flow_log
+
+# --- STEP 6: Keep only FONASA beneficiaries (A, B, C, D) ---
+tmp <- apply_filter_step(
+  filtered_data,
+  PREVISION %in% c(
+    "FONASA INSTITUCIONAL - (MAI) A",
+    "FONASA INSTITUCIONAL - (MAI) B",
+    "FONASA INSTITUCIONAL - (MAI) C",
+    "FONASA INSTITUCIONAL - (MAI) D"
+  ),
+  "Excluded non-FONASA insurance categories",
+  flow_log
+)
+filtered_data <- tmp$data; flow_log <- tmp$flow_log
+
+# --- MINSAL cutoffs ---
+norma_minsal_cortes <- minsal_df %>%
+  dplyr::select(COD_GRD = 1, EM_norma = 8, PC_inf = 17, PC_sup = 18) %>%
+  dplyr::mutate(
+    COD_GRD  = stringr::str_pad(as.character(COD_GRD), width = 6, side = "left", pad = "0"),
+    EM_norma = as.numeric(EM_norma),
+    PC_inf   = as.numeric(PC_inf),
+    PC_sup   = as.numeric(PC_sup)
+  ) %>%
+  dplyr::filter(!is.na(COD_GRD))
+
+data_con_limites <- filtered_data %>%
+  dplyr::mutate(IR_29301_COD_GRD = stringr::str_pad(
+    as.character(IR_29301_COD_GRD), width = 6, side = "left", pad = "0")) %>%
+  dplyr::left_join(norma_minsal_cortes, by = c("IR_29301_COD_GRD" = "COD_GRD"))
+
+df_inliers <- data_con_limites %>%  dplyr::filter(    !is.na(PC_inf), !is.na(PC_sup),    days_total_hospitalization >= PC_inf,    days_total_hospitalization <= PC_sup  )
+
+df_outliers <- data_con_limites %>%  dplyr::filter(    !is.na(PC_inf), !is.na(PC_sup),    days_total_hospitalization < PC_inf |      days_total_hospitalization > PC_sup  ) 
+
+df_unclassified <- data_con_limites %>%  dplyr::filter(is.na(PC_inf) | is.na(PC_sup)) 
+
+# --- STEP 7a: DRG without MINSAL reference ---
+tmp <- apply_filter_step(
+  data_con_limites,
+  !is.na(PC_inf) & !is.na(PC_sup),
+  "Excluded DRG without MINSAL 2014 reference",
+  flow_log
+)
+filtered_data <- tmp$data; flow_log <- tmp$flow_log
+
+# Breakdown of outliers (for the flow diagram and the mortality check)
+n_low  <- sum(filtered_data$days_total_hospitalization <  filtered_data$PC_inf, na.rm = TRUE)
+n_high <- sum(filtered_data$days_total_hospitalization >  filtered_data$PC_sup, na.rm = TRUE)
+
+# --- STEP 7b: LOS within MINSAL limits ---
+tmp <- apply_filter_step(
+  filtered_data,
+  days_total_hospitalization >= PC_inf & days_total_hospitalization <= PC_sup,
+  "Excluded LOS outside MINSAL 2014 limits",
+  flow_log
+)
+copd_data <- tmp$data; flow_log <- tmp$flow_log
+
+# --- STEP 8: Dichotomise admission type ---
+copd_data <- copd_data %>%
+  dplyr::mutate(TIPO_INGRESO = dplyr::if_else(TIPO_INGRESO == "URGENCIA",
+                                              "URGENCIA", "PROGRAMADA"))
+```
+
+```{r flow_summary, echo=FALSE, message=FALSE, warning=FALSE}
+print(flow_log, n = Inf, width = Inf)
+
+cat("\n")
+cat("Initial database:", nrow(raw_data), "\n")
+
+study_period_n <- flow_log %>%
+  dplyr::filter(step == "Excluded outside study period (2019-2024)") %>%
+  dplyr::pull(remaining_n)
+
+adults_n <- flow_log %>%
+  dplyr::filter(step == "Excluded age < 40 years") %>%
+  dplyr::pull(remaining_n)
+
+known_demo_n <- flow_log %>%
+  dplyr::filter(step == "Excluded unknown province or sex") %>%
+  dplyr::pull(remaining_n)
+
+insurance_n <- flow_log %>%
+  dplyr::filter(step == "Excluded non-FONASA insurance categories") %>%
+  dplyr::pull(remaining_n)
+
+hospital_service_n <- flow_log %>%
+  dplyr::filter(step == "Excluded missing hospital label or invalid health service") %>%
+  dplyr::pull(remaining_n)
+
+cat("After study period filter:", study_period_n, "\n")
+cat("After adult-only filter:", adults_n, "\n")
+cat("After known demographics filter:", known_demo_n, "\n")
+cat("With GRD cutoffs joined:", nrow(data_con_limites), "\n")
+cat("Inliers before administrative filters:", nrow(df_inliers), "\n")
+cat("Outliers:", nrow(df_outliers), "\n")
+cat("Unclassified:", nrow(df_unclassified), "\n")
+cat("After insurance filter:", insurance_n, "\n")
+cat("After hospital/health service filter:", hospital_service_n, "\n")
+cat("Final analytic dataset:", nrow(copd_data), "\n")
+
+if ("UID_patient" %in% names(copd_data)) {
+  cat(
+    "Unique patients in final analytic dataset:",
+    data.table::uniqueN(copd_data$UID_patient),
+    "\n"
+  )
+}
+```
+
+```{r mortality_sensitivity, echo=FALSE, message=FALSE, warning=FALSE}
+mort_sens <- data_con_limites %>%
+  filter(!is.na(PC_inf), !is.na(PC_sup)) %>%
+  mutate(
+    group = if_else(
+      days_total_hospitalization >= PC_inf & days_total_hospitalization <= PC_sup,
+      "Inliers (analytic dataset)", "LOS outliers"
+    ),
+    death = TIPOALTA == "FALLECIDO"
+  )
+
+bind_rows(
+  mort_sens %>%
+    group_by(group) %>%
+    summarise(episodes = n(), deaths = sum(death), .groups = "drop"),
+  mort_sens %>%
+    summarise(group = "All episodes (inliers + outliers)",
+              episodes = n(), deaths = sum(death))
+) %>%
+  mutate(mortality_pct = round(100 * deaths / episodes, 1))
+```
+
+## Figure 1: study flow diagram
+
+```{r flow_diagram, echo=FALSE, message=FALSE, warning=FALSE}
+fmt <- function(x) lancet_int(x)
+
+excl <- flow_log[-1, ]
+stopifnot(nrow(excl) == 6)
+stopifnot(n_low == 0)   # the LOS label assumes no exclusions below the lower limit
+
+excl_labels <- c(
+  "admission outside 2019\u20132024",
+  "age <40 years",
+  "unknown sex or province",
+  "insurance other than FONASA tiers A\u2013D",
+  "DRG without MINSAL 2014 LOS reference",
+  "LOS above MINSAL 2014 upper limit"
+)
+
+k   <- nrow(excl)
+pts <- paste0("p", seq_len(k))
+exn <- paste0("e", seq_len(k))
+
+n_pat_ini <- if ("UID_patient" %in% names(raw_data)) data.table::uniqueN(raw_data$UID_patient) else NA
+n_pat_fin <- data.table::uniqueN(copd_data$UID_patient)
+
+lab_A <- sprintf("COPD episodes, FONASA DRG discharge database\\n(ICD-10 J44.0, J44.1, J44.8, J44.9)\\n%s episodes%s",
+                 fmt(nrow(raw_data)),
+                 if (!is.na(n_pat_ini)) sprintf("; %s patients", fmt(n_pat_ini)) else "")
+lab_Z <- sprintf("Final analytic dataset\\n%s episodes; %s patients",
+                 fmt(nrow(copd_data)), fmt(n_pat_fin))
+
+flow_txt <- paste0("
+digraph flowchart {
+  graph [layout = dot, rankdir = TB, nodesep = 0.4, ranksep = 0.15, bgcolor = white]
+  node  [fontname = Helvetica, fontsize = 9, shape = rectangle, penwidth = 0.8, color = black]
+  edge  [color = gray30, arrowsize = 0.6, penwidth = 0.8, arrowhead = none]
+
+  A [label = '", lab_A, "', width = 3.2, height = 0.7]
+  Z [label = '", lab_Z, "', width = 3.2, height = 0.6, penwidth = 1.2]
+",
+  paste0(pts, " [shape = point, width = 0.01, height = 0.01, label = '']", collapse = "\n"), "\n",
+  paste0(sprintf("%s [label = 'Excluded: %s\\nn = %s', width = 3.0, height = 0.45, color = gray40]",
+                 exn, excl_labels, fmt(excl$excluded_n)), collapse = "\n"), "\n",
+  paste(c("A", pts), collapse = " -> "), "\n",
+  pts[k], " -> Z [arrowhead = normal]\n",
+  paste0(pts, " -> ", exn, " [arrowhead = normal]", collapse = "\n"), "\n",
+  paste0("{rank = same; ", pts, "; ", exn, "}", collapse = "\n"),
+"\n}")
+
+flow_plot <- DiagrammeR::grViz(flow_txt)
+flow_plot
+
+# Export at 180 mm width and 300 dpi (= 2126 px), as for Figures 2 and 3
+svg_txt <- DiagrammeRsvg::export_svg(flow_plot)
+
+# Check: natural SVG size and effective font size once scaled to 180 mm
+svg_w_pt <- as.numeric(sub(".*?width=\"([0-9.]+)pt\".*", "\\1", svg_txt))
+svg_h_pt <- as.numeric(sub(".*?height=\"([0-9.]+)pt\".*", "\\1", svg_txt))
+scale    <- (180 / 25.4 * 72) / svg_w_pt
+cat(sprintf("Effective font size: %.1f pt | final height: %.0f mm\n",
+            9 * scale, svg_h_pt * scale * 25.4 / 72))
+
+dir.create(here::here("figures"), showWarnings = FALSE)
+out_png <- here::here("figures", "Figure_1.png")
+rsvg::rsvg_png(charToRaw(svg_txt), out_png, width = 2126)
+
+# Declare 300 dpi in the file (rsvg does not write it)
+img <- magick::image_read(out_png)
+magick::image_write(img, out_png, format = "png", density = "300x300")
+```
+
+# Derived variables
+
+## Comorbidity indices
+
+```{r comorb_prep, echo=FALSE, message=FALSE, warning=FALSE}
+fmt_n <- function(x) lancet_int(x)
+fmt_p <- function(x) lancet_num(x, 1)
+
+# Avoid duplicated columns (.x/.y) if the chunk is run more than once
+copd_data <- copd_data %>%
+  select(-any_of(c("episode_id", "death", "charlson_score", "cci_group",
+                   "elixhauser_score", "elixhauser_n", "elixhauser_n_nocopd",
+                   "elix_group"))) %>%
+  mutate(
+    episode_id = row_number(),
+    death      = TIPOALTA == "FALLECIDO"
+  )
+
+## 1. Diagnoses in long format (principal + secondary) ------------------
+icd_cols <- intersect(paste0("CODIGO", 1:35), names(copd_data))
+
+diag_long <- copd_data %>%
+  tibble::as_tibble() %>%
+  select(episode_id, all_of(icd_cols)) %>%
+  mutate(across(all_of(icd_cols), as.character)) %>%
+  pivot_longer(all_of(icd_cols), names_to = "position", values_to = "code",
+               values_drop_na = TRUE) %>%
+  mutate(code = str_remove_all(toupper(code), "[^A-Z0-9]")) %>%   # "J44.1" -> "J441"
+  filter(code != "") %>%
+  transmute(id = episode_id, code) %>%
+  distinct()
+
+stopifnot(n_distinct(diag_long$id) == nrow(copd_data))
+
+## 2. Charlson (Quan ICD-10, pesos Quan) ----------------------------------
+cci_map <- comorbidity::comorbidity(
+  x = as.data.frame(diag_long), id = "id", code = "code",
+  map = "charlson_icd10_quan", assign0 = TRUE
+)
+
+cci_df <- tibble::as_tibble(cci_map) %>%
+  mutate(
+    charlson_score = as.numeric(comorbidity::score(cci_map, weights = "quan", assign0 = TRUE)),
+    cci_group = cut(charlson_score, breaks = c(-Inf, 2, 4, Inf),
+                    labels = c("Low (0\u20132)", "Intermediate (3\u20134)", "High (>4)"))
+  )
+
+## 3. Elixhauser (Quan ICD-10, pesos van Walraven) ------------------------
+elix_map <- comorbidity::comorbidity(
+  x = as.data.frame(diag_long), id = "id", code = "code",
+  map = "elixhauser_icd10_quan", assign0 = TRUE
+)
+elix_cols <- setdiff(names(elix_map), "id")
+
+elix_df <- tibble::as_tibble(elix_map) %>%
+  mutate(
+    elixhauser_score    = as.numeric(comorbidity::score(elix_map, weights = "vw", assign0 = TRUE)),
+    elixhauser_n        = rowSums(across(all_of(elix_cols))),   # 0/1 indicators only
+    elixhauser_n_nocopd = elixhauser_n - cpd,                   # excluding COPD
+    elix_group = cut(elixhauser_n_nocopd, breaks = c(-Inf, 0, 2, 4, Inf),
+                     labels = c("0", "1\u20132", "3\u20134", "\u22655"))
+  )
+
+## 4. Checks: all episodes should have 'cpd' = 1 --------------------------
+cat("Episodes without COPD detected (Charlson):",   sum(cci_df$cpd  == 0), "\n")
+cat("Episodes without COPD detected (Elixhauser):", sum(elix_df$cpd == 0), "\n")
+
+## 5. Unir a copd_data ------------------------------------------------------
+copd_data <- copd_data %>%
+  left_join(cci_df %>% select(episode_id = id, charlson_score, cci_group),
+            by = "episode_id") %>%
+  left_join(elix_df %>% select(episode_id = id, elixhauser_score,
+                               elixhauser_n, elixhauser_n_nocopd, elix_group),
+            by = "episode_id")
+```
+
+```{r comorb_summary, echo=FALSE, message=FALSE, warning=FALSE}
+iqr_txt <- function(x) {
+  q <- quantile(x, c(0.25, 0.50, 0.75), na.rm = TRUE)
+  sprintf("median %s (IQR %s\u2013%s)", q[2], q[1], q[3])
+}
+
+cat("CCI:", iqr_txt(cci_df$charlson_score), "\n")
+cci_df %>%
+  count(cci_group, .drop = FALSE) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+
+cat("Elixhauser van Walraven:", iqr_txt(elix_df$elixhauser_score), "\n")
+cat("Elixhauser, number of conditions excluding COPD:",
+    iqr_txt(elix_df$elixhauser_n_nocopd), "\n")
+elix_df %>%
+  count(elix_group, .drop = FALSE) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+```{r comorb_functions, echo=FALSE, message=FALSE, warning=FALSE}
+cci_labels <- c(
+  mi       = "Myocardial infarction",
+  chf      = "Congestive heart failure",
+  pvd      = "Peripheral vascular disease",
+  cevd     = "Cerebrovascular disease",
+  dementia = "Dementia",
+  cpd      = "Chronic pulmonary disease",
+  rheumd   = "Rheumatic disease",
+  pud      = "Peptic ulcer disease",
+  mld      = "Mild liver disease",
+  diab     = "Diabetes without chronic complications",
+  diabwc   = "Diabetes with chronic complications",
+  hp       = "Hemiplegia or paraplegia",
+  rend     = "Renal disease",
+  canc     = "Any malignancy",
+  msld     = "Moderate or severe liver disease",
+  metacanc = "Metastatic solid tumour",
+  aids     = "AIDS/HIV"
+)
+
+elix_labels <- c(
+  chf = "Congestive heart failure", carit = "Cardiac arrhythmias",
+  valv = "Valvular disease", pcd = "Pulmonary circulation disorders",
+  pvd = "Peripheral vascular disorders", hypunc = "Hypertension, uncomplicated",
+  hypc = "Hypertension, complicated", para = "Paralysis",
+  ond = "Other neurological disorders", cpd = "Chronic pulmonary disease",
+  diabunc = "Diabetes, uncomplicated", diabc = "Diabetes, complicated",
+  hypothy = "Hypothyroidism", rf = "Renal failure", ld = "Liver disease",
+  pud = "Peptic ulcer disease (excluding bleeding)", aids = "AIDS/HIV",
+  lymph = "Lymphoma", metacanc = "Metastatic cancer",
+  solidtum = "Solid tumour without metastasis",
+  rheumd = "Rheumatoid arthritis/collagen vascular disease",
+  coag = "Coagulopathy", obes = "Obesity", wloss = "Weight loss",
+  fed = "Fluid and electrolyte disorders", blane = "Blood loss anaemia",
+  dane = "Deficiency anaemia", alcohol = "Alcohol abuse", drug = "Drug abuse",
+  psycho = "Psychoses", depre = "Depression"
+)
+
+# Top N comorbidities (excluding COPD) with mortality and Fisher's exact test
+comorb_mortality <- function(comorb_df, labels, outcome_df,
+                             exclude = "cpd", top_n = 10) {
+  vars <- intersect(setdiff(names(labels), exclude), names(comorb_df))
+  d <- outcome_df %>%
+    tibble::as_tibble() %>%
+    select(id = episode_id, death) %>%
+    inner_join(comorb_df %>% select(id, all_of(vars)), by = "id")
+
+  purrr::map_dfr(vars, function(v) {
+    x   <- d[[v]] == 1
+    tbl <- table(factor(x, levels = c(FALSE, TRUE)),
+                 factor(d$death, levels = c(FALSE, TRUE)))
+    tibble(
+      Comorbidity  = unname(labels[v]),
+      N            = sum(x),
+      Prevalence   = 100 * mean(x),
+      Mort_with    = 100 * mean(d$death[x]),
+      Mort_without = 100 * mean(d$death[!x]),
+      p_value      = fisher.test(tbl)$p.value
+    )
+  }) %>%
+    arrange(desc(N)) %>%
+    slice_head(n = top_n)
+}
+
+# Paper-style table (same format as Table 1)
+comorb_flextable <- function(tab, caption, n_total) {
+  tab %>%
+    transmute(
+      Comorbidity  = paste0(Comorbidity, if_else(p_value < 0.05, "*", "")),
+      N            = fmt_n(N),
+      Prevalence   = fmt_p(Prevalence),
+      Mort_with    = fmt_p(Mort_with),
+      Mort_without = fmt_p(Mort_without),
+      p            = lancet_p(p_value)
+    ) %>%
+    flextable::flextable() %>%
+    flextable::set_header_labels(
+      Comorbidity  = "Comorbidity",
+      N            = "N",
+      Prevalence   = "Prevalence (%)",
+      Mort_with    = "Mortality with (%)",
+      Mort_without = "Mortality without (%)",
+      p            = "p-value"
+    ) %>%
+    flextable::theme_booktabs() %>%
+    flextable::bold(part = "header") %>%
+    flextable::align(j = 2:6, align = "center", part = "all") %>%
+    flextable::font(fontname = "Times New Roman", part = "all") %>%
+    flextable::fontsize(size = 10, part = "all") %>%
+    flextable::set_caption(caption) %>%
+    flextable::add_footer_lines(paste0(
+      "Data from ", fmt_n(n_total), " COPD hospitalisation episodes, Chilean FONASA/GRD system (2019\u20132024). ",
+      "Prevalence: episodes with the condition over all episodes. ",
+      "Mortality with/without: in-hospital mortality among episodes with/without the condition. ",
+      "Analyses were conducted at the episode level; patients may contribute more than one episode. ",
+      "Chronic pulmonary disease (COPD) is not listed because it was present in all episodes. ",
+      "*p<0\u00B705 (Fisher's exact test)."
+    )) %>%
+    flextable::fontsize(size = 8, part = "footer") %>%
+    flextable::autofit()
+}
+
+# Support for the text: significant conditions and absolute mortality differences
+describe_table <- function(tab) {
+  cat("Significant (p < 0.05):", sum(tab$p_value < 0.05), "of", nrow(tab), "\n")
+  tab %>%
+    mutate(diff = round(Mort_with - Mort_without, 1)) %>%
+    arrange(desc(abs(diff))) %>%
+    select(Comorbidity, Mort_with, Mort_without, diff, p_value) %>%
+    print()
+}
+```
+
+## Procedures
+
+```{r procedures_prep, echo=FALSE, message=FALSE, warning=FALSE}
+## 1. Procedure columns (ICD-9-CM) ----------------------------------------
+# ADJUST the pattern if your columns are named differently
+proc_cols <- grep("^PROC_CODIGO\\d+$", names(copd_data), value = TRUE)
+if (length(proc_cols) == 0) {
+  stop("No procedure columns found: adjust the proc_cols pattern")
+}
+cat("Procedure columns found:", length(proc_cols), "\n")
+
+## 2. Long format, codes without dot ("93.96" -> "9396") -----------------
+proc_long <- copd_data %>%
+  tibble::as_tibble() %>%
+  select(episode_id, all_of(proc_cols)) %>%
+  mutate(across(all_of(proc_cols), as.character)) %>%
+  pivot_longer(all_of(proc_cols), values_to = "code", values_drop_na = TRUE) %>%
+  mutate(code = str_remove_all(toupper(code), "[^A-Z0-9]")) %>%
+  filter(code != "") %>%
+  distinct(episode_id, code)
+
+# Check: the 15 most frequent codes (9396, 9921, 9923... should appear)
+proc_long %>% count(code, sort = TRUE) %>% slice_head(n = 15) %>% print()
+
+## 3. Procedure definitions -------------------------------------------------
+proc_defs <- list(
+  oxygen   = "9396",                             # Oxygen enrichment
+  iv_abx   = "9921",                             # Injection of antibiotic
+  iv_ster  = "9923",                             # Injection of steroid
+  iv_other = "9929",                             # Other therapeutic infusion
+  niv      = "9390",                             # Non-invasive mechanical ventilation
+  imv      = c("9604", "9670", "9671", "9672")   # Intubation / invasive MV
+)
+
+proc_labels <- c(
+  oxygen   = "Oxygen therapy (93.96)",
+  iv_abx   = "Intravenous antibiotics (99.21)",
+  iv_ster  = "Intravenous corticosteroids (99.23)",
+  iv_other = "Other therapeutic infusion (99.29)",
+  niv      = "Non-invasive ventilation (93.90)",
+  imv      = "Invasive mechanical ventilation (96.04, 96.70\u201396.72)"
+)
+
+## 4. Episode-level indicators (idempotent) --------------------------------
+proc_indicator_cols <- paste0("proc_", names(proc_defs))
+
+copd_data <- copd_data %>%
+  select(-any_of(proc_indicator_cols))
+
+for (nm in names(proc_defs)) {
+  ids <- unique(proc_long$episode_id[proc_long$code %in% proc_defs[[nm]]])
+
+  copd_data <- copd_data %>%
+    mutate(!!paste0("proc_", nm) := episode_id %in% ids)
+}
+
+copd_data %>%
+  tibble::as_tibble() %>%
+  summarise(
+    across(
+      all_of(proc_indicator_cols),
+      ~ sum(.x, na.rm = TRUE)
+    )
+  ) %>%
+  print()
+```
+
+## FONASA tier
+
+```{r fonasa_prep, echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+copd_data <- copd_data %>%
+  mutate(tier = factor(str_sub(PREVISION, -1), levels = c("A", "B", "C", "D")))
+
+stopifnot(!anyNA(copd_data$tier))
+print(table(copd_data$tier, useNA = "ifany"))
+
+# Check: patients who change tier between episodes
+copd_data %>%
+  tibble::as_tibble() %>%
+  group_by(UID_patient) %>%
+  summarise(n_tiers = n_distinct(tier), .groups = "drop") %>%
+  count(n_tiers, name = "patients") %>%
+  print()
+```
+
+# Main tables
+
+## Table 1: characteristics by FONASA tier
+
+```{r table_1_tier, echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+## 1. Recoding ---------------------------------------------------------------
+t1_cols <- c("A", "B", "C", "D", "Total")
+
+t1_data <- copd_data %>%
+  tibble::as_tibble() %>%
+  mutate(
+    age_group = case_when(
+      age >= 40 & age <= 54 ~ "40\u201354",
+      age >= 55 & age <= 74 ~ "55\u201374",
+      age >= 75             ~ "\u226575"
+    ),
+    sex       = case_when(SEXO == "MUJER" ~ "Women", SEXO == "HOMBRE" ~ "Men"),
+    adm_type  = if_else(TIPO_INGRESO == "URGENCIA", "Emergency", "Non-emergency"),
+    diag_code = str_remove(CODIGO1, "\\."),
+    diagnosis = case_when(
+      diag_code == "J441" ~ "COPD with acute exacerbation (J44.1)",
+      diag_code == "J440" ~ "COPD with acute lower respiratory infection (J44.0)",
+      diag_code == "J449" ~ "COPD, unspecified (J44.9)",
+      diag_code == "J448" ~ "Other specified COPD (J44.8)"
+    ),
+    severity  = as.character(factor(IR_29301_SEVERIDAD_LABEL,
+                                    levels = c("Menor", "Moderada", "Mayor"),
+                                    labels = c("Minor", "Moderate", "Major"))),
+    cci       = as.character(cci_group),
+    ethnicity = case_when(
+      ETNIA %in% c("NINGUNO", "NINGUNA") ~ "No Indigenous people recorded",
+      ETNIA == "OTRO"                    ~ "Other or not specified",
+      !is.na(ETNIA)                      ~ "Indigenous people"
+    )
+  )
+
+# Check: no values left unrecoded
+vars_check <- c("age_group", "sex", "adm_type", "diagnosis", "severity", "cci", "tier", "ethnicity")
+na_check   <- sapply(vars_check, function(v) sum(is.na(t1_data[[v]])))
+if (any(na_check > 0)) {
+  stop("Unrecoded values in: ", paste(names(na_check)[na_check > 0], collapse = ", "))
+}
+
+# Each episode appears in its tier and in the Total column
+t1_all <- bind_rows(
+  t1_data %>% mutate(col = as.character(tier)),
+  t1_data %>% mutate(col = "Total")
+) %>%
+  mutate(col = factor(col, levels = t1_cols))
+
+## 2. Row builders -----------------------------------------------------------
+wide <- function(d) d %>% pivot_wider(names_from = col, values_from = cell)
+
+row_median <- function(var, label) {
+  t1_all %>%
+    group_by(col) %>%
+    summarise(cell = iqr_fmt(.data[[var]]), .groups = "drop") %>%
+    wide() %>%
+    mutate(Characteristic = label, type = "header")
+}
+
+row_binary <- function(var, label, type = "item") {
+  t1_all %>%
+    group_by(col) %>%
+    summarise(cell = n_pct(sum(.data[[var]]), n()), .groups = "drop") %>%
+    wide() %>%
+    mutate(Characteristic = label, type = type)
+}
+
+block_cat <- function(var, levels, title) {
+  body <- t1_all %>%
+    mutate(level = factor(.data[[var]], levels = levels)) %>%
+    count(col, level, .drop = FALSE) %>%
+    group_by(col) %>%
+    mutate(cell = n_pct(n, sum(n))) %>%
+    ungroup() %>%
+    select(col, level, cell) %>%
+    wide() %>%
+    transmute(Characteristic = as.character(level), across(all_of(t1_cols)), type = "item")
+  bind_rows(tibble(Characteristic = title, type = "header"), body)
+}
+
+## 3. Table --------------------------------------------------------------------
+tab1 <- bind_rows(
+  row_median("age", "Age, years"),
+  block_cat("age_group", c("40\u201354", "55\u201374", "\u226575"), "Age group, years"),
+  block_cat("sex", c("Women", "Men"), "Sex"),
+  block_cat("ethnicity",
+            c("Indigenous people", "No Indigenous people recorded", "Other or not specified"),
+            "Ethnicity, as recorded"),
+  block_cat("adm_type", c("Emergency", "Non-emergency"), "Admission type"),
+  block_cat("diagnosis",
+            c("COPD with acute exacerbation (J44.1)",
+              "COPD with acute lower respiratory infection (J44.0)",
+              "COPD, unspecified (J44.9)",
+              "Other specified COPD (J44.8)"),
+            "Principal diagnosis"),
+  block_cat("severity", c("Minor", "Moderate", "Major"), "DRG severity level"),
+  block_cat("cci", c("Low (0\u20132)", "Intermediate (3\u20134)", "High (>4)"),
+            "Charlson Comorbidity Index"),
+  tibble(Characteristic = "Ventilatory support", type = "header"),
+  row_binary("proc_niv", "Non-invasive ventilation"),
+  row_binary("proc_imv", "Invasive mechanical ventilation"),
+  row_median("days_total_hospitalization", "Length of stay, days"),
+  row_binary("death", "In-hospital death", type = "header")
+) %>%
+  mutate(across(all_of(t1_cols), ~ coalesce(.x, ""))) %>%
+  select(Characteristic, all_of(t1_cols), type)
+
+# Check: columns add up to the total
+n_col <- t1_all %>% count(col)
+stopifnot(sum(n_col$n[n_col$col != "Total"]) == n_col$n[n_col$col == "Total"])
+
+print(tab1 %>% select(-type), n = Inf, width = Inf)
+
+## 4. Lancet format ------------------------------------------------------------
+hdr <- c(
+  list(Characteristic = ""),
+  setNames(
+    as.list(paste0(if_else(n_col$col == "Total", "Total", paste("FONASA", n_col$col)),
+                   "\n(n=", lancet_int(n_col$n), ")")),
+    as.character(n_col$col)
+  )
+)
+
+ft_t1 <- tab1 %>%
+  select(-type) %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(values = hdr) %>%
+  flextable::theme_booktabs() %>%
+  flextable::bold(part = "header") %>%
+  flextable::bold(i = which(tab1$type == "header"), j = 1) %>%
+  flextable::padding(i = which(tab1$type == "item"), j = 1, padding.left = 18) %>%
+  flextable::align(j = 2:6, align = "center", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::set_caption("Table 1: Characteristics of COPD hospitalisation episodes by FONASA tier, Chile, 2019\u20132024") %>%
+  flextable::add_footer_lines(paste(
+    "Data are median (IQR) or n (%). Percentages are calculated within each column and may not sum to 100% owing to rounding.",
+    "FONASA tiers are defined by income: tier A includes people without income or receiving family subsidies,",
+    "and tiers B, C, and D correspond to increasing monthly income.",
+    "Patients may contribute episodes in more than one tier.",
+    "Non-emergency admissions include scheduled and other admission types.",
+    "Ventilatory procedures are not mutually exclusive.",
+    "Indigenous people include Mapuche, Diaguita, Rapa Nui, Kawésqar, Aymara, Yagán, Colla, Lican Antai, and Quechua.",
+    "COPD=chronic obstructive pulmonary disease. DRG=diagnosis-related group.",
+    "FONASA=Fondo Nacional de Salud (National Health Fund). IQR=interquartile range."
+  )) %>%
+  flextable::fontsize(size = 8, part = "footer") %>%
+  flextable::autofit()
+
+ft_T1 <- ft_t1
+ft_T1
+
+# Optional: export to Word
+# flextable::save_as_docx(ft_t1, path = here::here("tables", "Table_1.docx"))
+```
+
+## Table 2: Charlson conditions and in-hospital mortality
+
+```{r table_2_charlson, echo=FALSE, message=FALSE, warning=FALSE}
+table2 <- comorb_mortality(cci_df, cci_labels, copd_data)
+describe_table(table2)
+
+comorb_flextable(
+  table2,
+  caption = "Table 2: Ten most frequent Charlson Comorbidity Index conditions and in-hospital mortality in COPD hospitalisation episodes, Chile, 2019\u20132024",
+  n_total = nrow(copd_data)
+) -> ft_T2
+ft_T2
+```
+
+## Table 3: multivariable models
+
+```{r mortality_models, echo=FALSE, message=FALSE, warning=FALSE}
+## 0. DRG relative weight variable: ADJUST if named differently --------------
+weight_var <- "IR_29301_PESO"
+if (!weight_var %in% names(copd_data)) {
+  stop(weight_var, " not found. Variables containing 'PESO': ",
+       paste(grep("PESO", names(copd_data), value = TRUE), collapse = ", "))
+}
+
+# Convert text with decimal comma or point to numeric
+to_num <- function(x) {
+  if (is.numeric(x)) return(x)
+  as.numeric(str_replace(str_trim(as.character(x)), ",", "."))
+}
+
+## 1. Model data --------------------------------------------------------------
+model_data <- copd_data %>%
+  tibble::as_tibble() %>%
+  transmute(
+    death            = as.integer(death),
+    imv              = as.integer(proc_imv),
+    niv              = as.integer(proc_niv),
+    oxygen           = as.integer(proc_oxygen),
+    age,
+    female           = as.integer(SEXO == "MUJER"),   # reference: men
+    charlson_score,
+    elixhauser_score,
+    rw               = to_num(.data[[weight_var]]),
+    UID_patient
+  )
+
+# Missing values by variable BEFORE dropping rows
+na_by_var <- sapply(model_data, function(x) sum(is.na(x)))
+print(na_by_var)
+
+n_before   <- nrow(model_data)
+model_data <- model_data %>% tidyr::drop_na()
+n_lost     <- n_before - nrow(model_data)
+
+if (n_lost > 0.05 * n_before) {
+  stop(n_lost, " of ", n_before,
+       " episodes lost owing to missing values. Check the variables with NA above.")
+}
+
+cat("Episodes in models:", nrow(model_data), "| excluded for missing data:", n_lost, "\n")
+cat("Deaths:", sum(model_data$death), "\n")
+cat("SD age:", round(sd(model_data$age), 1), "years",
+    "| SD relative weight:", round(sd(model_data$rw), 3), "\n")
+
+model_data <- model_data %>%
+  mutate(
+    age_z = as.numeric(scale(age)),
+    rw_z  = as.numeric(scale(rw))
+  )
+
+## 2. Logistic regression with patient-clustered robust SEs -----------------
+fit_or <- function(formula, data) {
+  fit <- glm(formula, data = data, family = binomial)
+  vc  <- sandwich::vcovCL(fit, cluster = data$UID_patient)
+  ct  <- lmtest::coeftest(fit, vcov. = vc)
+  auc <- as.numeric(pROC::auc(data$death, fitted(fit), quiet = TRUE))
+
+  list(
+    fit = fit,
+    auc = auc,
+    tab = tibble(
+      term    = rownames(ct),
+      OR      = exp(ct[, 1]),
+      lo      = exp(ct[, 1] - 1.96 * ct[, 2]),
+      hi      = exp(ct[, 1] + 1.96 * ct[, 2]),
+      p_value = ct[, 4]
+    ) %>%
+      filter(term != "(Intercept)")
+  )
+}
+
+## 3. Modelos ---------------------------------------------------------------
+m_cci  <- fit_or(death ~ imv + niv + oxygen + age_z + female + charlson_score   + rw_z, model_data)
+m_elix <- fit_or(death ~ imv + niv + oxygen + age_z + female + elixhauser_score + rw_z, model_data)
+m_norw <- fit_or(death ~ imv + niv + oxygen + age_z + female + charlson_score,          model_data)
+
+cat("\nAUC CCI model:", round(m_cci$auc, 3),
+    "| AUC Elixhauser model:", round(m_elix$auc, 3),
+    "| AUC CCI model without relative weight:", round(m_norw$auc, 3), "\n\n")
+
+cat("CCI model\n");                                         print(m_cci$tab)
+cat("\nElixhauser model\n");                                print(m_elix$tab)
+cat("\nSensitivity: CCI model without relative weight\n");  print(m_norw$tab)
+
+## 4. Table 3 -------------------------------------------------------------------
+labels_s2 <- c(
+  imv              = "Invasive mechanical ventilation",
+  niv              = "Non-invasive ventilation",
+  oxygen           = "Oxygen therapy",
+  age_z            = "Age (per 1 SD)",
+  female           = "Female sex",
+  charlson_score   = "CCI score (per point)",
+  elixhauser_score = "Elixhauser van Walraven score (per point)",
+  rw_z             = "Episode relative weight (per 1 SD)"
+)
+
+p_fmt  <- function(p) lancet_p(p)
+or_fmt <- function(or, lo, hi) lancet_ci(or, lo, hi, 2)
+
+fmt_model <- function(tab, prefix) {
+  tab %>%
+    transmute(
+      term,
+      !!paste0(prefix, "_or") := or_fmt(OR, lo, hi),
+      !!paste0(prefix, "_p")  := p_fmt(p_value)
+    )
+}
+
+table_s2 <- tibble(term = names(labels_s2), Variable = unname(labels_s2)) %>%
+  left_join(fmt_model(m_cci$tab,  "cci"),  by = "term") %>%
+  left_join(fmt_model(m_elix$tab, "elix"), by = "term") %>%
+  mutate(across(c(cci_or, cci_p, elix_or, elix_p), ~ coalesce(.x, "\u2014"))) %>%
+  select(-term)
+
+table_s2 %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(
+    Variable = "Variable",
+    cci_or = "OR (95% CI)", cci_p = "p value",
+    elix_or = "OR (95% CI)", elix_p = "p value"
+  ) %>%
+  flextable::add_header_row(values = c("", "Charlson model", "Elixhauser model"),
+                            colwidths = c(1, 2, 2)) %>%
+  flextable::theme_booktabs() %>%
+  flextable::bold(part = "header") %>%
+  flextable::align(j = 2:5, align = "center", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::set_caption("Table 3: Multivariable logistic regression models for in-hospital mortality in COPD hospitalisation episodes, Chile, 2019\u20132024") %>%
+  flextable::add_footer_lines(paste0(
+    "Models fitted on ", fmt_n(nrow(model_data)), " episodes (", fmt_n(sum(model_data$death)), " deaths). ",
+    "Robust standard errors clustered at the patient level to account for multiple episodes per patient. ",
+    "Age: 1 SD = ", lancet_num(sd(model_data$age), 1), " years. ",
+    "AUC: ", lancet_num(m_cci$auc, 3), " (CCI model) and ", lancet_num(m_elix$auc, 3), " (Elixhauser model). ",
+    "Reference categories: male sex; absence of each ventilatory procedure. ", 
+    "In a sensitivity analysis excluding DRG relative weight, the OR for invasive mechanical ventilation was 5\u00B798 (95% CI 5\u00B727\u20136\u00B779); other estimates were virtually unchanged. ",
+    "CCI, Charlson Comorbidity Index; CI, confidence interval; OR, odds ratio."
+  )) %>%
+  flextable::fontsize(size = 8, part = "footer") %>%
+  flextable::autofit() -> ft_T3
+ft_T3
+```
+
+# Main figures
+
+## Figure 2: cumulative incidence of in-hospital death
+
+```{r cif_prep}
+# Check: severity values present in the database
+print(table(copd_data$IR_29301_SEVERIDAD_LABEL, useNA = "ifany"))
+
+cif_data <- copd_data %>%
+  tibble::as_tibble() %>%
+  transmute(
+    los      = days_total_hospitalization,
+    status   = factor(if_else(death, "death", "discharge"),
+                      levels = c("censor", "discharge", "death")),
+    sex      = factor(if_else(SEXO == "MUJER", "Women", "Men"),
+                      levels = c("Men", "Women")),
+    severity = factor(IR_29301_SEVERIDAD_LABEL,
+                      levels = c("Menor", "Moderada", "Mayor"),
+                      labels = c("Minor", "Moderate", "Major")),
+    cci      = cci_group
+  )
+
+stopifnot(!anyNA(cif_data$sex), !anyNA(cif_data$cci))
+if (anyNA(cif_data$severity)) {
+  stop("Severity values other than 'Menor', 'Moderada' or 'Mayor' found: check the table above")
+}
+
+p95_los <- as.numeric(quantile(cif_data$los, 0.95))
+cat("P95 LOS:", p95_los, "days\n")
+```
+
+```{r cif_functions}
+## Cumulative incidence of death (Aalen–Johansen), discharge alive as competing event
+cif_analysis <- function(var, t_max = p95_los) {
+  d   <- cif_data %>% mutate(grp = .data[[var]])
+  fit <- survival::survfit(survival::Surv(los, status) ~ grp, data = d)
+  j   <- which(fit$states == "death")
+  s   <- summary(fit, times = 0:t_max, extend = TRUE)
+
+  curve <- tibble(
+    group  = factor(str_remove(as.character(s$strata), "^grp="), levels = levels(d$grp)),
+    time   = s$time,
+    cif    = s$pstate[, j],
+    lo     = s$lower[, j],
+    hi     = s$upper[, j],
+    n_risk = s$n.risk[, 1]
+  )
+
+  # Gray's test (fstatus: 0 = censored, 1 = discharged alive, 2 = death)
+  gray <- cmprsk::cuminc(ftime = d$los, fstatus = as.integer(d$status) - 1L,
+                         group = d$grp, cencode = 0)
+  
+  # p value computed directly from the upper tail
+  gray_stat <- unname(gray$Tests["2", "stat"])
+  gray_df   <- unname(gray$Tests["2", "df"])
+
+  gray_p <- stats::pchisq(
+    gray_stat,
+    df = gray_df,
+    lower.tail = FALSE
+  )
+
+  list(
+    curve  = curve,
+    p_gray    = gray_p,
+    gray_stat = gray_stat,
+    gray_df   = gray_df,
+    crude  = d %>%
+      group_by(group = grp) %>%
+      summarise(episodes = n(), deaths = sum(status == "death"),
+                crude_mortality = round(100 * deaths / episodes, 1), .groups = "drop")
+  )
+}
+
+## Support table for the text: day 15 and P95
+cif_table <- function(res, at = c(15, p95_los)) {
+  res$curve %>%
+    filter(time %in% at) %>%
+    mutate(across(c(cif, lo, hi), ~ round(100 * .x, 1))) %>%
+    select(group, time, cif, lo, hi, n_risk)
+}
+
+format_gray_p <- function(p) {
+  if (is.na(p)) return("p unavailable")
+  if (p < 0.0001) return("p<0\u00b70001")
+
+  value <- if (p < 0.001) {
+    sprintf("%.4f", p)
+  } else {
+    sprintf("%.3f", p)
+  }
+
+  paste0("p=", sub(".", "\u00b7", value, fixed = TRUE))
+}
+
+## Returns both parts (curves + risk table) to align them in a single patchwork
+plot_cif_parts <- function(res, panel, y_max, t_max = p95_los) {
+  curve <- res$curve %>%
+    group_by(group) %>%
+    arrange(time, .by_group = TRUE) %>%
+    mutate(time_end = lead(time, default = max(time))) %>%
+    ungroup()
+
+  greys <- c("black", "grey40", "grey65")[seq_len(nlevels(curve$group))]
+  p_lab <- paste("Gray's test", format_gray_p(res$p_gray))
+
+  main <- ggplot(curve, aes(x = time)) +
+    geom_rect(aes(xmin = time, xmax = time_end, ymin = lo, ymax = hi, fill = group),
+              alpha = 0.15) +
+    geom_step(aes(y = cif, colour = group, linetype = group), linewidth = 0.6) +
+    annotate("text", x = t_max, y = y_max * 0.97, label = p_lab,
+             hjust = 1, vjust = 1, size = 2.8) +
+    scale_colour_manual(values = greys) +
+    scale_fill_manual(values = greys) +
+    scale_x_continuous(breaks = seq(0, t_max, 5), limits = c(0, t_max)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       breaks = seq(0, y_max, by = 0.05),
+                       limits = c(0, y_max), expand = c(0, 0)) +
+    labs(title = panel, x = "Days since admission",
+         y = "Cumulative incidence\nof in-hospital death",
+         colour = NULL, fill = NULL, linetype = NULL) +
+    theme_bw(base_size = 8, base_family = "sans") +
+    theme(
+      panel.grid           = element_blank(),
+      plot.title           = element_text(face = "bold", size = 9, hjust = 0.02),
+      plot.title.position  = "plot",
+      axis.title           = element_text(face = "bold"),
+      axis.title.y         = element_text(
+        margin = margin(r = 10, unit = "pt")
+      ),
+      axis.text            = element_text(colour = "black"),
+      legend.position      = c(0.02, 0.97),
+      legend.justification = c(0, 1),
+      legend.background    = element_rect(
+        fill = "white", colour = "black", linewidth = 0.3
+      ),
+      legend.key.height    = unit(3.5, "mm"),
+      plot.margin          = margin(t = 8, r = 4, b = 0, l = 4)
+    )
+
+  risk <- ggplot(curve %>% filter(time %in% seq(0, t_max, by = 5)),
+                 aes(x = time, y = forcats::fct_rev(group),
+                     label = fmt_n(as.integer(n_risk)))) +
+    geom_text(size = 2.8) +
+    scale_x_continuous(breaks = seq(0, t_max, 5), limits = c(0, t_max)) +
+    coord_cartesian(clip = "off") +
+    labs(subtitle = "Number at risk", x = NULL, y = NULL) +
+    theme_minimal(base_size = 8, base_family = "sans") +
+    theme(panel.grid    = element_blank(),
+          axis.text.x   = element_blank(),
+          axis.text.y   = element_text(colour = "black"),
+          plot.subtitle = element_text(size = 8),
+          plot.margin   = margin(t = 2, r = 4, b = 4, l = 4))
+
+  list(main = main, risk = risk)
+}
+```
+
+```{r cif_sex, fig.width=7, fig.height=6, fig.cap="Cumulative incidence of in-hospital death by sex."}
+res_sex <- cif_analysis("sex")
+print(res_sex$crude)
+print(cif_table(res_sex))
+cat("Gray's test p:", signif(res_sex$p_gray, 3), "\n")
+```
+
+```{r cif_severity, fig.width=7, fig.height=6, fig.cap="Cumulative incidence of in-hospital death by DRG severity level."}
+res_sev <- cif_analysis("severity")
+print(res_sev$crude)
+print(cif_table(res_sev))
+cat("Gray's test p:", signif(res_sev$p_gray, 3), "\n")
+```
+
+```{r cif_cci, fig.width=7, fig.height=6, fig.cap="Cumulative incidence of in-hospital death by Charlson Comorbidity Index category."}
+res_cci <- cif_analysis("cci")
+print(res_cci$crude)
+print(cif_table(res_cci))
+cat("Gray's test p:", signif(res_cci$p_gray, 3), "\n")
+```
+
+```{r figure2}
+y_common <- ceiling(
+  max(c(res_sex$curve$hi, res_sev$curve$hi, res_cci$curve$hi)) * 20
+) / 20
+
+pa <- plot_cif_parts(res_sex, "a)", y_common)
+pb <- plot_cif_parts(res_sev, "b)", y_common)
+pc <- plot_cif_parts(res_cci, "c)", y_common)
+
+# Shorten the longest risk-table label while preserving score ranges
+pc$risk <- pc$risk +
+  scale_y_discrete(
+    labels = function(x) sub("Intermediate", "Interm.", x, fixed = TRUE)
+  )
+
+# Reduce outer left margins consistently
+compact_parts <- function(parts) {
+  parts$main <- parts$main +
+    theme(plot.margin = margin(t = 8, r = 4, b = 0, l = 1))
+
+  parts$risk <- parts$risk +
+    theme(plot.margin = margin(t = 2, r = 4, b = 4, l = 1))
+
+  parts
+}
+
+pa <- compact_parts(pa)
+pb <- compact_parts(pb)
+pc <- compact_parts(pc)
+
+fig2 <- (
+  patchwork::free(pa$main, type = "label", side = "l") / pa$risk /
+  patchwork::free(pb$main, type = "label", side = "l") / pb$risk /
+  patchwork::free(pc$main, type = "label", side = "l") / pc$risk
+) +
+  patchwork::plot_layout(
+    heights = c(4, 0.8, 4, 1.1, 4, 1.1)
+  )
+
+fig2
+
+dir.create(here::here("figures"), showWarnings = FALSE)
+
+ggsave(
+  filename = here::here("figures", "Figure_2_cif.png"),
+  plot = fig2,
+  width = 180,
+  height = 225,
+  units = "mm",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+## Figure 3: provincial hospitalisation rates
+
+```{r rates_prep}
+## 0. Rate numerator ------------------------------------------------------------
+#  TRUE (recommended): all COPD discharges aged >=40 years, 2019-2024, with known
+#   province and sex, without exclusions by insurance or length-of-stay outliers.
+# FALSE: analytic dataset only (copd_data).
+use_all_episodes <- TRUE
+rates_source <- if (use_all_episodes) rates_data else copd_data
+
+years   <- 2019:2024
+norm_nm <- function(x) str_squish(toupper(stringi::stri_trans_general(x, "Latin-ASCII")))
+
+## 1. INE population aged >=40 years by province and year --------------------
+ine <- readxl::read_excel(here::here("data", "estimaciones-y-proyecciones-2002-2035-comunas.xlsx"))
+
+needed <- c("Provincia", "Nombre Provincia", "Edad", paste("Poblacion", years))
+if (!all(needed %in% names(ine))) {
+  stop("Missing columns in the INE file: ",
+       paste(setdiff(needed, names(ine)), collapse = ", "))
+}
+
+pop_40 <- ine %>%
+  filter(as.numeric(Edad) >= 40) %>%
+  select(Provincia, `Nombre Provincia`, all_of(paste("Poblacion", years))) %>%
+  pivot_longer(starts_with("Poblacion"), names_to = "year",
+               names_prefix = "Poblacion ", values_to = "population") %>%
+  mutate(
+    year             = as.integer(year),
+    codigo_provincia = sprintf("%03d", as.integer(Provincia)),
+    provincia_norm   = norm_nm(`Nombre Provincia`)
+  ) %>%
+  group_by(codigo_provincia, provincia_norm, province = `Nombre Provincia`, year) %>%
+  summarise(population = sum(population, na.rm = TRUE), .groups = "drop")
+
+stopifnot(!any(duplicated(distinct(pop_40, codigo_provincia, provincia_norm)$codigo_provincia)))
+
+pop_prov <- pop_40 %>%
+  group_by(codigo_provincia, provincia_norm, province) %>%
+  summarise(person_years = sum(population), .groups = "drop") %>%
+  mutate(pop_mean = person_years / length(years))
+
+cat("Provinces in INE file:", nrow(pop_prov), "\n")
+
+## 2. Cases by province (derived from municipality of residence) -------------
+fix_prov <- function(x) case_when(
+  x == "BIO-BIO"   ~ "BIOBIO",
+  x == "AISEN"     ~ "AYSEN",
+  x == "COIHAIQUE" ~ "COYHAIQUE",
+  TRUE ~ x
+)
+
+fix_comuna <- function(x) {
+  x <- str_replace_all(x, '"', "'")          # O"HIGGINS -> O'HIGGINS
+  case_when(
+    x == "COIHAIQUE" ~ "COYHAIQUE",
+    x == "CON CON"   ~ "CONCON",
+    x == "AISEN"     ~ "AYSEN",
+    TRUE ~ x
+  )
+}
+
+# Municipality -> province according to INE (same file as the denominator)
+comuna_lookup <- ine %>%
+  distinct(`Nombre Comuna`, Provincia) %>%
+  transmute(
+    comuna_norm      = norm_nm(`Nombre Comuna`),
+    codigo_provincia = sprintf("%03d", as.integer(Provincia))
+  ) %>%
+  distinct() %>%
+  left_join(pop_prov %>% select(codigo_provincia, prov_from_comuna = provincia_norm),
+            by = "codigo_provincia")
+
+stopifnot(!any(duplicated(comuna_lookup$comuna_norm)))
+
+cases <- rates_source %>%
+  tibble::as_tibble() %>%
+  transmute(
+    year          = lubridate::year(fecha_ingreso_dt),
+    comuna_norm   = fix_comuna(norm_nm(COMUNA)),
+    prov_declared = fix_prov(norm_nm(PROVINCIA))
+  ) %>%
+  left_join(comuna_lookup %>% select(comuna_norm, prov_from_comuna), by = "comuna_norm") %>%
+  mutate(
+    # Province from municipality; if the municipality does not match, PROVINCIA is used
+    provincia_norm = coalesce(prov_from_comuna, prov_declared)
+  )
+
+cat("Episodes assigned by COMUNA:", sum(!is.na(cases$prov_from_comuna)),
+    "| by PROVINCIA (comuna not matched):", sum(is.na(cases$prov_from_comuna)), "\n")
+
+# Check: allocation of episodes with the former province "NUBLE"
+cat("Former 'NUBLE' episodes by assigned province:\n")
+cases %>% filter(prov_declared == "NUBLE") %>% count(provincia_norm) %>% print()
+
+stopifnot(all(cases$year %in% years))
+
+unmatched <- setdiff(unique(cases$provincia_norm), pop_prov$provincia_norm)
+if (length(unmatched) > 0) {
+  stop("Provinces without a match in the INE file: ",
+       paste(unmatched, collapse = ", "), ". Add them to fix_prov() or fix_comuna().")
+}
+
+cases_prov <- cases %>% count(provincia_norm, name = "cases")
+
+## 3. Rates by province (from the population: provinces without cases = 0) ---
+add_rate <- function(d, cases_col = "cases", py_col = "person_years") {
+  x  <- d[[cases_col]]
+  py <- d[[py_col]]
+  d %>%
+    mutate(
+      rate = 1e5 * x / py,
+      lo   = 1e5 * qchisq(0.025, 2 * x) / 2 / py,
+      hi   = 1e5 * qchisq(0.975, 2 * (x + 1)) / 2 / py
+    )
+}
+
+zone_of <- function(reg) {
+  factor(case_when(
+    reg %in% c("15", "01", "02", "03", "04") ~ "North",
+    reg %in% c("05", "13", "06", "07", "16") ~ "Centre",
+    reg %in% c("08", "09", "14", "10")       ~ "South",
+    reg %in% c("11", "12")                   ~ "Austral"
+  ), levels = c("North", "Centre", "South", "Austral"))
+}
+
+rates_prov <- pop_prov %>%
+  left_join(cases_prov, by = "provincia_norm") %>%
+  mutate(
+    cases         = coalesce(cases, 0L),
+    codigo_region = substr(codigo_provincia, 1, 2),
+    zone          = zone_of(codigo_region)
+  ) %>%
+  add_rate() %>%
+  arrange(desc(rate))
+
+stopifnot(sum(rates_prov$cases) == nrow(cases), !anyNA(rates_prov$zone))
+
+cat("Episodes used for rates:", nrow(cases), "\n")
+cat("Provinces with zero episodes:",
+    paste(rates_prov$province[rates_prov$cases == 0], collapse = ", "), "\n\n")
+
+rates_prov %>%
+  transmute(province, zone, cases, pop_mean = round(pop_mean),
+            across(c(rate, lo, hi), ~ round(.x, 1))) %>%
+  print(n = Inf)
+
+santiago_n <- rates_prov$cases[rates_prov$province == "Santiago"]
+cat("Santiago:", santiago_n, "episodes (",
+    lancet_num(100 * santiago_n / nrow(cases), 1), "% of", nrow(cases), ")\n")
+```
+
+```{r rates_summary}
+## National rate by year and for the whole period ----------------------------
+pop_year <- pop_40 %>% group_by(year) %>% summarise(person_years = sum(population), .groups = "drop")
+
+rates_year <- bind_rows(
+  cases %>%
+    count(year, name = "cases") %>%
+    left_join(pop_year, by = "year") %>%
+    mutate(period = as.character(year)),
+  tibble(period = "2019\u20132024", cases = nrow(cases), person_years = sum(pop_year$person_years))
+) %>%
+  add_rate() %>%
+  select(period, cases, person_years, rate, lo, hi)
+
+print(rates_year %>% mutate(across(c(rate, lo, hi), ~ round(.x, 1))))
+
+## Rate by macrozone ------------------------------------------------------------
+rates_zone <- rates_prov %>%
+  group_by(zone) %>%
+  summarise(cases = sum(cases), person_years = sum(person_years), .groups = "drop") %>%
+  add_rate()
+
+print(rates_zone %>% mutate(across(c(rate, lo, hi), ~ round(.x, 1))))
+```
+
+```{r map_data}
+regiones_norte   <- c("15", "01", "02", "03", "04")
+regiones_centro  <- c("05", "13", "06", "07", "16")
+regiones_sur     <- c("08", "09", "14", "10")
+regiones_austral <- c("11", "12")
+
+mapa_provincias <- chilemapas::mapa_comunas %>%
+  group_by(codigo_provincia) %>%
+  summarise(geometry = sf::st_union(geometry), .groups = "drop") %>%
+  sf::st_as_sf()
+
+# Check: match by INE province code = chilemapas
+no_map <- setdiff(rates_prov$codigo_provincia, mapa_provincias$codigo_provincia)
+no_rate <- setdiff(mapa_provincias$codigo_provincia, rates_prov$codigo_provincia)
+if (length(no_map) > 0 || length(no_rate) > 0) {
+  stop("Province codes do not match. With rate but not on the map: ", paste(no_map, collapse = ", "),
+       " | On the map but without rate: ", paste(no_rate, collapse = ", "))
+}
+
+mapa_data <- mapa_provincias %>%
+  left_join(
+    rates_prov %>%
+      select(codigo_provincia, codigo_region, province, avg_incidence_rate = rate),
+    by = "codigo_provincia"
+  ) %>%
+  mutate(
+    nombre_provincia = province,   # INE names, identical to those in the tables
+    nombre_corto     = province
+  )
+```
+
+```{r map_layers}
+# STEP 5.5: Add province numbers and identify high incidence provinces
+# Province number = order in rates_prov (decreasing rate), as in Table S6
+rank_tab <- rates_prov %>%
+  mutate(provincia_num = row_number()) %>%
+  select(codigo_provincia, provincia_num)
+
+mapa_data <- mapa_data %>%
+  left_join(rank_tab, by = "codigo_provincia") %>%
+  mutate(
+    avg_incidence_rate = if_else(avg_incidence_rate == 0, NA_real_, avg_incidence_rate),
+    is_high_incidence  = provincia_num <= 5
+  )
+
+# Recreate zone subsets with numbers
+mapa_norte <- mapa_data %>% filter(codigo_region %in% regiones_norte)
+mapa_centro <- mapa_data %>% filter(codigo_region %in% regiones_centro)
+mapa_sur <- mapa_data %>% filter(codigo_region %in% regiones_sur)
+mapa_austral <- mapa_data %>% filter(codigo_region %in% regiones_austral)
+
+
+# STEP 6: Helper function for NUMBER labels (replaces text labels)
+make_number_labels <- function(sf_obj) {
+  # Compute centroids for number placement
+  centroids <- sf::st_point_on_surface(sf::st_geometry(sf_obj))
+  coords <- sf::st_coordinates(centroids)
+  
+  sf_obj %>%
+    sf::st_drop_geometry() %>%
+    mutate(
+      lab_x = coords[, 1],
+      lab_y = coords[, 2]
+    )
+}
+
+# Generate number label positions
+labels_norte_num   <- make_number_labels(mapa_norte)
+labels_centro_num  <- make_number_labels(mapa_centro)
+labels_sur_num     <- make_number_labels(mapa_sur)
+labels_austral_num <- make_number_labels(mapa_austral)
+
+
+# Number label layer
+
+number_label_layer <- function(label_df) {
+  ggrepel::geom_label_repel(
+    data = label_df,
+    ggplot2::aes(x = lab_x, y = lab_y, label = provincia_num),
+    size = 2.2, fontface = "bold", colour = "black", fill = "white",
+    label.padding = grid::unit(0.1, "lines"), label.size = 0.2,
+    box.padding = 0.15, min.segment.length = 0, segment.size = 0.2,
+    max.overlaps = Inf, seed = 1
+  )
+}
+
+
+# Optional: Add province NAMES only for high incidence areas (top 10)
+high_incidence_label_layer <- function(label_df) {
+  high_inc <- label_df %>% filter(is_high_incidence == TRUE)
+  
+  if (nrow(high_inc) > 0) {
+    ggplot2::geom_label(  # Changed from geom_text to geom_label
+      data = high_inc,
+      ggplot2::aes(x = lab_x, y = lab_y, label = nombre_corto),
+      size = 3.0,
+      color = "black",
+      fontface = "bold",
+      fill = "white",  # White background
+      label.padding = grid::unit(0.15, "lines"),
+      label.size = 0.3,
+      alpha = 0.9
+    )
+  } else {
+    geom_blank()  # Return empty layer if no high incidence provinces
+  }
+}
+
+# STEP 7: Create maps with NUMBERS
+# Panel A: Complete map
+# Common fill scale
+max_rate <- max(mapa_data$avg_incidence_rate, na.rm = TRUE)
+
+fill_scale <- scale_fill_gradientn(
+  colours  = viridisLite::viridis(7, option = "G", alpha = 0.8, direction = -1),
+  name     = "Hospitalisations per 100\u2009000 person-years",
+  limits   = c(0, max_rate),
+  na.value = "grey90",
+  labels   = scales::label_comma(accuracy = 1),
+  guide    = guide_colourbar(
+    direction = "horizontal",
+    title.position = "top",
+    title.hjust = 0.5,
+    barwidth  = unit(6, "cm"),
+    barheight = unit(0.3, "cm"),
+    frame.colour = "gray28",
+    ticks.colour = "gray28"
+  )
+)
+
+make_zone_map <- function(zone_sf, label_df, xlim, ylim, title, tag) {
+  label_df <- label_df %>%
+    filter(between(lab_x, xlim[1], xlim[2]), between(lab_y, ylim[1], ylim[2]))
+  
+  suppressWarnings(
+    ggplot(zone_sf) +
+      geom_sf(aes(fill = avg_incidence_rate), colour = "gray28", linewidth = 0.2) +
+      number_label_layer(label_df) +
+      coord_sf(xlim = xlim, ylim = ylim, expand = FALSE, clip = "on") +
+      fill_scale +
+      labs(subtitle = title, tag = tag) +
+      theme_void(base_size = 8, base_family = "sans") +
+      theme(
+        plot.subtitle     = element_text(hjust = 0.5, size = 9, face = "bold"),
+        plot.tag          = element_text(size = 9, face = "bold"),
+        plot.tag.position = c(0.02, 0.98),
+        plot.margin       = margin(2, 2, 2, 2)
+      )
+  )
+}
+
+p_norte   <- make_zone_map(mapa_norte,   labels_norte_num,   c(-72.5, -64),   c(-32.5, -17.5), "North",   "a)")
+p_centro  <- make_zone_map(mapa_centro,  labels_centro_num,  c(-72.9, -69.7), c(-37.3, -32),   "Centre",  "b)")
+p_sur     <- make_zone_map(mapa_sur,     labels_sur_num,     c(-75, -70),     c(-44, -36.5),   "South",   "c)")
+p_austral <- make_zone_map(mapa_austral, labels_austral_num, c(-76.5, -66.5), c(-56, -43.5),   "Austral", "d)")
+```
+
+```{r figure_3_map, fig.width=7.09, fig.height=8.86}
+# STEP 8: Create zone-specific legend tables
+# Province tables by macrozone
+zone_table_theme <- gridExtra::ttheme_minimal(
+  base_size = 7,
+  padding = grid::unit(c(1.0, 0.6), "mm"),
+  core = list(
+    fg_params = list(hjust = 0, x = 0.04),
+    bg_params = list(fill = c("white", "grey95"))
+  ),
+  colhead = list(
+    fg_params = list(
+      fontface = "bold",
+      hjust = 0,
+      x = 0.04
+    ),
+    bg_params = list(fill = "grey80")
+  )
+)
+
+create_zone_table <- function(mapa_zone, n_cols = 1, x_offset_mm = 0) {
+
+  zl <- mapa_zone %>%
+    sf::st_drop_geometry() %>%
+    filter(!is.na(nombre_provincia)) %>%
+    arrange(nombre_provincia) %>%
+    transmute(
+      `#` = provincia_num,
+      Province = nombre_provincia
+    )
+
+  # Split the province list into adjacent table blocks
+  block_size <- ceiling(nrow(zl) / n_cols)
+
+  blocks <- split(
+    zl,
+    ceiling(seq_len(nrow(zl)) / block_size)
+  )
+
+  # Pad shorter blocks to keep table heights consistent
+  blocks <- lapply(blocks, function(x) {
+    x[] <- lapply(x, as.character)
+
+    if (nrow(x) < block_size) {
+      blank_rows <- x[
+        rep(NA_integer_, block_size - nrow(x)),
+        ,
+        drop = FALSE
+      ]
+      blank_rows[] <- ""
+      x <- rbind(x, blank_rows)
+    }
+
+    x
+  })
+
+  grobs <- lapply(
+    blocks,
+    gridExtra::tableGrob,
+    rows = NULL,
+    theme = zone_table_theme
+  )
+
+    # 4 mm space between adjacent blocks
+  if (length(grobs) > 1) {
+    grobs[-length(grobs)] <- lapply(grobs[-length(grobs)], gtable::gtable_add_cols,
+                                    widths = grid::unit(4, "mm"))
+  }
+
+  tab <- if (length(grobs) == 1) grobs[[1]] else do.call(gridExtra::gtable_cbind, grobs)
+
+  # Apply an optional horizontal offset without changing table dimensions
+  aligned_table <- grid::grobTree(
+    tab,
+    vp = grid::viewport(
+      x = grid::unit(x_offset_mm, "mm"),
+      y = 0.5,
+      width = grid::grobWidth(tab),
+      height = grid::grobHeight(tab),
+      just = c("left", "centre")
+    )
+  )
+
+  out <- patchwork::wrap_elements(full = aligned_table, clip = FALSE) +
+  theme(plot.margin = margin(0, 0, 0, 0))
+
+  # Actual table width, to allocate exactly that space in the panel
+  attr(out, "width_mm") <- grid::convertWidth(sum(tab$widths), "mm", valueOnly = TRUE) + x_offset_mm
+  out
+}
+
+table_norte <- create_zone_table(mapa_norte)
+
+# Shift only the Centre table to the right
+table_centro <- create_zone_table(mapa_centro)
+
+table_sur <- create_zone_table(mapa_sur)
+
+table_austral <- create_zone_table(mapa_austral)
+
+# Keep map margins small
+map_theme <- theme(
+  plot.margin = margin(2, 2, 2, 2, unit = "pt")
+)
+
+# Map (flexible width) + fixed space + table (exact width)
+make_panel <- function(map, tab, gap_mm = 3) {
+  (map + map_theme) + plot_spacer() + tab +
+    plot_layout(widths = grid::unit(c(1, gap_mm, attr(tab, "width_mm")),
+                                    c("null", "mm", "mm")))
+}
+
+panel_norte   <- make_panel(p_norte,   table_norte)
+panel_centro  <- make_panel(p_centro,  table_centro)
+panel_sur     <- make_panel(p_sur,     table_sur)
+panel_austral <- make_panel(p_austral, table_austral)
+
+# Leave an empty column and row between macrozone panels
+layout_design <- "
+A#B
+###
+C#D
+"
+
+p_fig3 <- patchwork::wrap_plots(
+  A = panel_norte,
+  B = panel_centro,
+  C = panel_sur,
+  D = panel_austral,
+  design = layout_design,
+  widths = grid::unit(
+    c(1, 5, 1),
+    c("null", "mm", "null")
+  ),
+  heights = grid::unit(
+    c(1, 6, 1),
+    c("null", "mm", "null")
+  ),
+  guides = "collect"
+) &
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7),
+    legend.margin = margin(t = 3, r = 0, b = 0, l = 0),
+    legend.box.spacing = grid::unit(2, "mm"),
+    #plot.margin = margin(0, 0, 0, 8, unit = "pt")
+  )
+
+p_fig3
+
+dir.create(here::here("figures"), showWarnings = FALSE)
+
+ggsave(
+  filename = here::here("figures", "Figure_3_map.png"),
+  plot = p_fig3,
+  width = 180,
+  height = 225,
+  units = "mm",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+# Appendix
+
+## Table S1: length of stay by year and sex
+
+```{r table_5_los_year, echo=FALSE, message=FALSE, warning=FALSE}
+los_year <- copd_data %>%
+  tibble::as_tibble() %>%
+  mutate(
+    year = lubridate::year(fecha_ingreso_dt),
+    sex  = case_when(SEXO == "HOMBRE" ~ "Men", SEXO == "MUJER" ~ "Women"),
+    los  = days_total_hospitalization
+  )
+stopifnot(!anyNA(los_year$sex), !anyNA(los_year$year), !anyNA(los_year$los))
+
+summ_year <- function(d) {
+  d %>%
+    summarise(
+      total_n   = n(),
+      total_los = iqr_fmt(los),
+      men_n     = sum(sex == "Men"),
+      men_los   = iqr_fmt(los[sex == "Men"]),
+      women_n   = sum(sex == "Women"),
+      women_los = iqr_fmt(los[sex == "Women"]),
+      .groups = "drop"
+    )
+}
+
+table5 <- bind_rows(
+  los_year %>% group_by(year) %>% summ_year() %>% mutate(year = as.character(year)),
+  los_year %>% summ_year() %>% mutate(year = "2019\u20132024")
+) %>%
+  mutate(across(ends_with("_n"), fmt_n))
+
+stopifnot(sum(los_year$sex == "Men") + sum(los_year$sex == "Women") == nrow(copd_data))
+print(table5)
+
+table5 %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(
+    year = "Year",
+    total_n = "Episodes", total_los = "LOS, median (IQR)",
+    men_n = "Episodes", men_los = "LOS, median (IQR)",
+    women_n = "Episodes", women_los = "LOS, median (IQR)"
+  ) %>%
+  flextable::add_header_row(values = c("", "Total", "Men", "Women"),
+                            colwidths = c(1, 2, 2, 2)) %>%
+  flextable::theme_booktabs() %>%
+  flextable::bold(part = "header") %>%
+  flextable::bold(i = nrow(table5)) %>%
+  flextable::align(j = 2:7, align = "center", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::set_caption("Table S1: Length of stay by year and sex in COPD hospitalisation episodes, Chile, 2019\u20132024") %>%
+  flextable::add_footer_lines(paste0(
+    "Data from ", fmt_n(nrow(copd_data)), " COPD hospitalisation episodes, Chilean FONASA/GRD system. ",
+    "Year of admission. LOS in days, restricted to inlier episodes according to the 2014 MINSAL standard. ",
+    "Analyses at the episode level; patients may contribute more than one episode. ",
+    "IQR, interquartile range; LOS, length of stay."
+  )) %>%
+  flextable::fontsize(size = 8, part = "footer") %>%
+  flextable::autofit() -> ft_S1
+ft_S1
+```
+
+## Table S2: quantile regression of length of stay
+
+```{r los_quantreg, cache=TRUE, cache.extra=rlang::hash(los_year[c("los", "year", "sex", "UID_patient")])}
+## Quantile regression with jittering (Machado & Santos Silva, 2005)
+## and patient-clustered bootstrap
+
+qr_data <- los_year %>%
+  mutate(
+    year = relevel(factor(year), ref = "2019"),
+    sex  = relevel(factor(sex),  ref = "Women")
+  )
+
+X <- model.matrix(~ year + sex, data = qr_data)
+y <- qr_data$los
+idx_by_patient <- split(seq_len(nrow(qr_data)), qr_data$UID_patient)
+
+# One fit with LOS + U(0,1)
+fit_jitter <- function(rows, tau) {
+  y_j <- y[rows] + runif(length(rows))
+  quantreg::rq.fit(X[rows, , drop = FALSE], y_j, tau = tau, method = "fn")$coefficients
+}
+
+taus <- c(0.50, 0.75, 0.90)
+J    <- 20    # jitters for the point estimate
+B    <- 200   # patient-level bootstrap replicates
+set.seed(2024)
+
+qr_results <- purrr::map_dfr(taus, function(tt) {
+  est <- rowMeans(replicate(J, fit_jitter(seq_len(nrow(X)), tt)))
+
+  boot <- replicate(B, {
+    pats <- sample(length(idx_by_patient), replace = TRUE)
+    fit_jitter(unlist(idx_by_patient[pats], use.names = FALSE), tt)
+  })
+  se <- apply(boot, 1, sd)
+
+  tibble(
+    tau      = tt,
+    term     = colnames(X),
+    estimate = est,
+    se       = se,
+    lo       = est - 1.96 * se,
+    hi       = est + 1.96 * se,
+    p_value  = 2 * pnorm(-abs(est / se))
+  )
+})
+
+print(qr_results, n = Inf)
+
+# Wide table: one column per quantile
+r1 <- function(x) lancet_num(round(x, 2) + 0, 2)   # avoids "-0.00"
+
+qr_table <- qr_results %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = term %>%
+      str_replace("^year(\\d{4})$", "Year \\1 (vs. 2019)") %>%
+      str_replace("^sexMen$", "Men (vs. women)"),
+    cell = paste0(r1(estimate), " (", r1(lo), " to ", r1(hi), ")",
+                  if_else(!is.na(p_value) & p_value < 0.05, "*", ""))
+  ) %>%
+  select(term, tau, cell) %>%
+  pivot_wider(names_from = tau, values_from = cell)
+
+qr_table %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(
+    term = "Variable",
+    `0.5` = "\u03C4 = 0.50", `0.75` = "\u03C4 = 0.75", `0.9` = "\u03C4 = 0.90"
+  ) %>%
+  flextable::theme_booktabs() %>%
+  flextable::bold(part = "header") %>%
+  flextable::align(j = 2:4, align = "center", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::set_caption("Table S2: Quantile regression of length of stay (days) by calendar year and sex in COPD hospitalisation episodes, Chile, 2019\u20132024") %>%
+  flextable::add_footer_lines(paste(
+    "Coefficients are absolute differences in days at each quantile of LOS (95% CI).",
+    "Reference categories: 2019 and women.",
+    "LOS was jittered with uniform U(0,1) noise to account for its discrete nature (estimates averaged over 20 jitters).",
+    "95% CIs from patient-clustered bootstrap (200 replicates). *p < 0.05."
+  )) %>%
+  flextable::fontsize(size = 8, part = "footer") %>%
+  flextable::autofit() -> ft_S2
+ft_S2
+```
+
+## Table S3: Elixhauser conditions and in-hospital mortality
+
+```{r table_3_elixhauser, echo=FALSE, message=FALSE, warning=FALSE}
+table3 <- comorb_mortality(elix_df, elix_labels, copd_data)
+describe_table(table3)
+
+comorb_flextable(
+  table3,
+  caption = "Table S3: Ten most frequent Elixhauser conditions and in-hospital mortality in COPD hospitalisation episodes, Chile, 2019\u20132024",
+  n_total = nrow(copd_data)
+) -> ft_S3
+ft_S3
+```
+
+## Table S4: procedures
+
+```{r table_4_procedures, echo=FALSE, message=FALSE, warning=FALSE}
+iqr_fmt <- function(x) {
+  q <- round(quantile(x, c(0.25, 0.50, 0.75), na.rm = TRUE))
+  sprintf("%s (%s\u2013%s)", q[2], q[1], q[3])
+}
+
+n_total <- nrow(copd_data)
+
+table4 <- purrr::map_dfr(names(proc_labels), function(nm) {
+  d <- copd_data %>%
+    tibble::as_tibble() %>%
+    transmute(flag = .data[[paste0("proc_", nm)]],
+              death,
+              los  = days_total_hospitalization)
+
+  grp <- d %>%
+    group_by(flag) %>%
+    summarise(n = n(), deaths = sum(death), los_txt = iqr_fmt(los), .groups = "drop") %>%
+    arrange(desc(flag))                                  # TRUE (with) first
+
+  bind_rows(
+    tibble(Group = proc_labels[[nm]], N = "", Mortality = "", LOS = "", type = "header"),
+    tibble(
+      Group     = c("With", "Without"),
+      N         = sprintf("%s (%s)", fmt_n(grp$n), fmt_p(100 * grp$n / n_total)),
+      Mortality = sprintf("%s (%s)", fmt_n(grp$deaths), fmt_p(100 * grp$deaths / grp$n)),
+      LOS       = grp$los_txt,
+      type      = "item"
+    )
+  )
+})
+
+print(table4 %>% select(-type), n = Inf)
+
+table4 %>%
+  select(-type) %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(
+    Group     = "Procedure",
+    N         = "Episodes, n (%)",
+    Mortality = "Deaths, n (%)",
+    LOS       = "LOS, median (IQR), days"
+  ) %>%
+  flextable::theme_booktabs() %>%
+  flextable::bold(part = "header") %>%
+  flextable::bold(i = which(table4$type == "header"), j = 1) %>%
+  flextable::padding(i = which(table4$type == "item"), j = 1, padding.left = 18) %>%
+  flextable::align(j = 2:4, align = "center", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::set_caption("Table S4: In-hospital mortality and length of stay by therapeutic procedure in COPD hospitalisation episodes, Chile, 2019\u20132024") %>%
+  flextable::add_footer_lines(paste0(
+    "Data from ", fmt_n(n_total), " COPD hospitalisation episodes, Chilean FONASA/GRD system (2019\u20132024). ",
+    "Procedures identified by ICD-9-CM codes recorded at any position. ",
+    "Episode percentages are based on all episodes; mortality percentages on episodes within each group. ",
+    "Analyses at the episode level; patients may contribute more than one episode. ",
+    "IQR, interquartile range; LOS, length of stay."
+  )) %>%
+  flextable::fontsize(size = 8, part = "footer") %>%
+  flextable::autofit() -> ft_S4
+ft_S4
+```
+
+## Table S5: FONASA tier and in-hospital death
+
+```{r fonasa_descriptive, echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+copd_tb <- copd_data %>% tibble::as_tibble()
+
+summ_tier <- function(d) {
+  d %>%
+    summarise(
+      episodes = n(),
+      patients = n_distinct(UID_patient),
+      age_txt  = iqr_fmt(age),
+      women    = sum(SEXO == "MUJER"),
+      cci_txt  = iqr_fmt(charlson_score),
+      cci_high = sum(cci_group == "High (>4)"),
+      niv      = sum(proc_niv),
+      imv      = sum(proc_imv),
+      deaths   = sum(death),
+      los_txt  = iqr_fmt(days_total_hospitalization),
+      .groups  = "drop"
+    )
+}
+
+tier_raw <- bind_rows(
+  copd_tb %>% group_by(tier) %>% summ_tier() %>% mutate(tier = as.character(tier)),
+  copd_tb %>% summ_tier() %>% mutate(tier = "Total")
+) %>%
+  mutate(
+    mort    = deaths / episodes,
+    mort_lo = wilson_ci(deaths, episodes)$lo,
+    mort_hi = wilson_ci(deaths, episodes)$hi
+  )
+
+print(tier_raw, width = Inf)
+
+## Tests (descriptive, episode level) -----------------------------------------
+# TRUE (with) first
+tiers_only <- tier_raw %>% filter(tier != "Total")
+chi_mort   <- chisq.test(table(copd_tb$tier, copd_tb$death))
+trend_mort <- prop.trend.test(x = tiers_only$deaths, n = tiers_only$episodes)
+
+cat("Mortality across tiers, chi-square p:", signif(chi_mort$p.value, 3),
+    "| chi-square test for trend p:", signif(trend_mort$p.value, 3), "\n")
+
+## Lancet-style table -----------------------------------------------------------
+tier_display <- tier_raw %>%
+  transmute(
+    tier,
+    `Patients, n`                     = lancet_int(patients),
+    `Age, years, median (IQR)`        = age_txt,
+    `Women`                           = n_pct(women, episodes),
+    `Charlson score, median (IQR)`    = cci_txt,
+    `High comorbidity burden (CCI >4)`= n_pct(cci_high, episodes),
+    `Non-invasive ventilation`        = n_pct(niv, episodes),
+    `Invasive mechanical ventilation` = n_pct(imv, episodes),
+    `Length of stay, days, median (IQR)` = los_txt,
+    `In-hospital deaths`              = n_pct(deaths, episodes),
+    `In-hospital mortality, % (95% CI)` = sprintf("%s (%s\u2013%s)",
+                                                  lancet_num(100 * mort),
+                                                  lancet_num(100 * mort_lo),
+                                                  lancet_num(100 * mort_hi))
+  )
+
+tier_wide <- tier_display %>%
+  pivot_longer(-tier, names_to = "Characteristic", values_to = "value") %>%
+  pivot_wider(names_from = tier, values_from = value)
+
+hdr <- c(
+  Characteristic = "",
+  setNames(
+    paste0(if_else(tier_raw$tier == "Total", "Total", paste("FONASA", tier_raw$tier)),
+           "\n(n=", lancet_int(tier_raw$episodes), ")"),
+    tier_raw$tier
+  )
+)
+
+```
+
+```{r fonasa_models, echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE}
+## 1. Data (same variables as model_data + tier) ------------------------------
+model_data_tier <- copd_data %>%
+  tibble::as_tibble() %>%
+  transmute(
+    death            = as.integer(death),
+    imv              = as.integer(proc_imv),
+    niv              = as.integer(proc_niv),
+    oxygen           = as.integer(proc_oxygen),
+    age,
+    female           = as.integer(SEXO == "MUJER"),
+    charlson_score,
+    elixhauser_score,
+    rw               = to_num(.data[[weight_var]]),
+    tier_num         = as.integer(tier),           # A=1, B=2, C=3, D=4 (tendencia)
+    tier             = relevel(tier, ref = "D"),   ## reference: tier D (highest income)
+    UID_patient
+  ) %>%
+  tidyr::drop_na() %>%
+  mutate(
+    age_z = as.numeric(scale(age)),
+    rw_z  = as.numeric(scale(rw))
+  )
+
+# Must match the main model (same episodes and same standardisation)
+# tier  = relevel(tier, ref = "D"),   
+# reference: tier D (highest income)
+stopifnot(nrow(model_data_tier) == nrow(model_data))
+
+## 2. Joint Wald test with patient-clustered robust variance -----------------
+wald_joint <- function(fit, cluster, pattern = "^tier[A-D]$") {
+  vc   <- sandwich::vcovCL(fit, cluster = cluster)
+  idx  <- grep(pattern, names(coef(fit)))
+  b    <- coef(fit)[idx]
+  V    <- vc[idx, idx, drop = FALSE]
+  stat <- as.numeric(t(b) %*% solve(V, b))
+  pchisq(stat, df = length(idx), lower.tail = FALSE)
+}
+
+fit_tier <- function(rhs) {
+  add     <- if (rhs == "") "" else paste("+", rhs)
+  m_cat   <- fit_or(as.formula(paste("death ~ tier", add)),     model_data_tier)
+  m_trend <- fit_or(as.formula(paste("death ~ tier_num", add)), model_data_tier)
+  list(
+    cat     = m_cat,
+    p_joint = wald_joint(m_cat$fit, model_data_tier$UID_patient),
+    p_trend = m_trend$tab$p_value[m_trend$tab$term == "tier_num"]
+  )
+}
+
+## 3. Modelos ---------------------------------------------------------------
+specs <- list(
+  crude     = "",
+  age_sex   = "age_z + female",
+  full_cci  = "imv + niv + oxygen + age_z + female + charlson_score + rw_z",
+  full_elix = "imv + niv + oxygen + age_z + female + elixhauser_score + rw_z"
+)
+
+tier_models <- purrr::map(specs, fit_tier)
+
+cat("AUC by model:\n")
+print(round(sapply(tier_models, function(x) x$cat$auc), 3))
+cat("AUC main CCI model without tier:", round(m_cci$auc, 3), "\n\n")
+
+cat("Fully adjusted CCI model with tier (all covariates):\n")
+print(tier_models$full_cci$cat$tab)
+
+## 4. Table of ORs by tier -----------------------------------------------------
+tier_or <- tibble(term = paste0("tier", LETTERS[1:4]),
+                  Tier = paste("FONASA", LETTERS[1:4]))
+
+for (nm in names(tier_models)) {
+  tier_or <- tier_or %>%
+    left_join(
+      tier_models[[nm]]$cat$tab %>%
+        filter(str_detect(term, "^tier[A-D]$")) %>%
+        transmute(term, !!nm := lancet_ci(OR, lo, hi)),
+      by = "term"
+    )
+}
+
+tier_or <- tier_or %>%
+  mutate(across(all_of(names(specs)), ~ coalesce(.x, "1 (ref)")))
+
+p_rows <- tibble(
+  term = c("p_joint", "p_trend"),
+  Tier = c("p value (joint Wald test)", "p value for trend")
+)
+for (nm in names(tier_models)) {
+  p_rows[[nm]] <- c(lancet_p(tier_models[[nm]]$p_joint), lancet_p(tier_models[[nm]]$p_trend))
+}
+
+tier_or_tab <- bind_rows(tier_or, p_rows) %>% select(-term)
+print(tier_or_tab)
+
+tier_or_tab %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(
+    Tier      = "",
+    crude     = "Unadjusted OR (95% CI)",
+    age_sex   = "Age-adjusted and sex-adjusted OR (95% CI)",
+    full_cci  = "Fully adjusted OR (95% CI), Charlson",
+    full_elix = "Fully adjusted OR (95% CI), Elixhauser"
+  ) %>%
+  flextable::theme_booktabs() %>%
+  flextable::bold(part = "header") %>%
+  flextable::align(j = 2:5, align = "center", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::set_caption("Table S5: Association between FONASA tier and in-hospital death in COPD hospitalisation episodes, Chile, 2019\u20132024") %>%
+  flextable::add_footer_lines(paste0(
+    "Logistic regression on ", lancet_int(nrow(model_data_tier)), " episodes from ",
+    lancet_int(n_distinct(model_data_tier$UID_patient)), " patients (",
+    lancet_int(sum(model_data_tier$death)), " deaths), with robust standard errors clustered by patient. ",
+    "Reference: tier D (highest income). Fully adjusted models include age (per 1 SD), sex, invasive mechanical ventilation, ",
+    "non-invasive ventilation, oxygen therapy, DRG relative weight (per 1 SD), and the Charlson Comorbidity Index score ",
+    "or the Elixhauser van Walraven score. The joint Wald test assesses any difference between tiers; ",
+    "the test for trend enters tier as an ordinal score (A=1 to D=4). DRG=diagnosis-related group. OR=odds ratio."
+  )) %>%
+  flextable::fontsize(size = 8, part = "footer") %>%
+  flextable::autofit() -> ft_S5
+ft_S5
+```
+
+## Figure S1: cumulative incidence by FONASA tier
+
+```{r cif_tier, echo=FALSE, message=FALSE, warning=FALSE, cache=FALSE, fig.width=7.09, fig.height=4.33, fig.cap="Cumulative incidence of in-hospital death by FONASA tier."}
+stopifnot(nrow(cif_data) == nrow(copd_data))
+
+cif_data <- cif_data %>%
+  mutate(tier = factor(paste("FONASA", as.character(copd_data$tier)),
+                       levels = paste("FONASA", LETTERS[1:4])))
+stopifnot(!anyNA(cif_data$tier))
+
+res_tier <- cif_analysis("tier")
+print(res_tier$crude)
+print(cif_table(res_tier))
+cat("Gray's test p:", signif(res_tier$p_gray, 3), "\n")
+
+y_tier <- ceiling(max(res_tier$curve$hi, na.rm = TRUE) * 20) / 20
+pt     <- plot_cif_parts(res_tier, "", y_tier)
+
+# plot_cif_parts provides 3 greys; tiers need 4
+greys4 <- c("black", "grey30", "grey50", "grey70")
+pt$main <- suppressMessages(
+  pt$main + scale_colour_manual(values = greys4) + scale_fill_manual(values = greys4)
+)
+
+fig_tier <- patchwork::free(pt$main, type = "label", side = "l") / pt$risk +
+  patchwork::plot_layout(heights = c(4, 1.3))
+
+fig_tier
+
+ggsave(
+  filename = here::here("figures", "Figure_S1_cif_tier.png"),
+  plot = fig_tier, width = 180, height = 110, units = "mm", dpi = 300, bg = "white"
+)
+```
+
+## Table S6: provincial hospitalisation rates
+
+```{r table_6_rates}
+rates_flextable <- function(d, caption) {
+  d %>%
+    transmute(
+      Province   = if_else(cases < 20, paste0(province, "\u2020"), province),
+      Zone       = as.character(zone),
+      Episodes   = fmt_n(cases),
+      Population = fmt_n(round(pop_mean)),
+      Rate       = lancet_ci(rate, lo, hi, 1)
+    ) %>%
+    flextable::flextable() %>%
+    flextable::set_header_labels(
+      Province   = "Province",
+      Zone       = "Macrozone",
+      Episodes   = "COPD hospitalisations, n",
+      Population = "Mean annual population aged \u226540 years",
+      Rate       = "Rate per 100\u2009000 person-years (95% CI)"
+    ) %>%
+    flextable::theme_booktabs() %>%
+    flextable::bold(part = "header") %>%
+    flextable::align(j = 2:5, align = "center", part = "all") %>%
+    flextable::font(fontname = "Times New Roman", part = "all") %>%
+    flextable::fontsize(size = 10, part = "all") %>%
+    flextable::set_caption(caption) %>%
+    flextable::add_footer_lines(paste0(
+      "Average annual hospitalisation rate: COPD discharge episodes among residents aged \u226540 years (n = ",
+      fmt_n(nrow(cases)), ", 2019\u20132024) divided by person-years aged \u226540 years ",
+      "(sum of annual population estimates and projections of the Chilean National Statistics Institute, 2019\u20132024). ",
+      "Episodes from public hospitals; patients may contribute more than one episode. ",       "\u2020 Rates based on fewer than 20 episodes should be interpreted with caution. ",
+      "95% CI from the exact Poisson distribution. Provinces ordered by decreasing rate."
+    )) %>%
+    flextable::fontsize(size = 8, part = "footer") %>%
+    flextable::autofit()
+}
+
+rates_flextable(
+  rates_prov,
+  "Table S6: Average annual COPD hospitalisation rates among adults aged \u226540 years by province, Chile, 2019\u20132024"
+) -> ft_S6
+ft_S6
+```
+
+## Table S7: annual national COPD hospitalisation rates among adults
+
+```{r table_s7_rates_network, echo=FALSE, message=FALSE, warning=FALSE}
+## Annual national rate: all hospitals vs stable network ----------------------
+hosp_cases <- rates_source %>%
+  tibble::as_tibble() %>%
+  transmute(
+    year         = lubridate::year(fecha_ingreso_dt),
+    COD_HOSPITAL = as.character(COD_HOSPITAL)
+  )
+
+# Must match the rate numerator
+stopifnot(nrow(hosp_cases) == nrow(cases))
+
+n_years_total <- n_distinct(hosp_cases$year)
+
+stable_hosp <- hosp_cases %>%
+  distinct(COD_HOSPITAL, year) %>%
+  count(COD_HOSPITAL, name = "n_years") %>%
+  filter(n_years == n_years_total) %>%
+  pull(COD_HOSPITAL)
+
+n_hosp_year <- hosp_cases %>%
+  group_by(year) %>%
+  summarise(hospitals = as.character(n_distinct(COD_HOSPITAL)), .groups = "drop")
+
+rates_compare <- bind_rows(
+  hosp_cases %>% mutate(network = "all"),
+  hosp_cases %>% filter(COD_HOSPITAL %in% stable_hosp) %>% mutate(network = "stable")
+) %>%
+  count(network, year, name = "cases") %>%
+  left_join(pop_year, by = "year") %>%
+  add_rate() %>%
+  group_by(network) %>%
+  mutate(change = 100 * (rate / rate[year == 2019] - 1)) %>%
+  ungroup()
+
+# Typographic minus sign (\u2212) for negative changes
+fmt_change <- function(x) sub("^-", "\u2212", lancet_num(x, 1))
+
+table_s7 <- rates_compare %>%
+  transmute(
+    year, network,
+    cases  = lancet_int(cases),
+    rate   = lancet_ci(rate, lo, hi, 1),
+    change = if_else(year == 2019, "\u2014", fmt_change(change))
+  ) %>%
+  pivot_wider(names_from = network, values_from = c(cases, rate, change)) %>%
+  left_join(n_hosp_year, by = "year") %>%
+  transmute(
+    Year = as.character(year), hospitals,
+    cases_all, rate_all, change_all,
+    cases_stable, rate_stable, change_stable
+  )
+
+print(table_s7)
+
+table_s7 %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(
+    Year          = "Year",
+    hospitals     = "Hospitals reporting, n",
+    cases_all     = "Episodes, n",
+    rate_all      = "Rate (95% CI)",
+    change_all    = "Change vs 2019, %",
+    cases_stable  = "Episodes, n",
+    rate_stable   = "Rate (95% CI)",
+    change_stable = "Change vs 2019, %"
+  ) %>%
+  flextable::add_header_row(
+    values    = c("", "", "All hospitals",
+                  paste0("Hospitals reporting in all years (n=", length(stable_hosp), ")")),
+    colwidths = c(1, 1, 3, 3)
+  ) %>%
+  flextable::theme_booktabs() %>%
+  flextable::bold(part = "header") %>%
+  flextable::align(j = 2:8, align = "center", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::set_caption("Table S7: Annual national COPD hospitalisation rates among adults aged \u226540 years in all reporting public hospitals and in hospitals reporting throughout the study period, Chile, 2019\u20132024") %>%
+  flextable::add_footer_lines(paste0(
+    "Rates per 100\u2009000 person-years: COPD discharge episodes among residents aged \u226540 years ",
+    "divided by the population aged \u226540 years (population estimates and projections of the Chilean National Statistics Institute). ",
+    "Seven hospitals began reporting through the DRG system in 2023 (n=4) or 2024 (n=3); ",
+    "they contributed ", lancet_int(sum(!hosp_cases$COD_HOSPITAL %in% stable_hosp)), " episodes. ",
+    "95% CIs from the exact Poisson distribution. DRG=diagnosis-related group."
+  )) %>%
+  flextable::fontsize(size = 8, part = "footer") %>%
+  flextable::autofit() -> ft_S7
+ft_S7
+```
+
+# Export of tables to Word
+
+```{r export_tables, echo=FALSE, message=FALSE, warning=FALSE}
+## Export tables to Word (landscape) ------------------------------------------
+dir.create(here::here("tables"), showWarnings = FALSE)
+
+landscape <- officer::prop_section(
+  page_size    = officer::page_size(orient = "landscape"),
+  page_margins = officer::page_mar(top = 0.8, bottom = 0.8, left = 0.8, right = 0.8)
+)
+
+main_tables     <- list(ft_T1, ft_T2, ft_T3)
+appendix_tables <- list(ft_S1, ft_S2, ft_S3, ft_S4, ft_S5, ft_S6, ft_S7)
+
+flextable::save_as_docx(values = main_tables,
+                        path = here::here("tables", "Tables_main.docx"),
+                        pr_section = landscape)
+flextable::save_as_docx(values = appendix_tables,
+                        path = here::here("tables", "Appendix_tables.docx"),
+                        pr_section = landscape)
+
+cat("Tables exported to:", here::here("tables"), "\n")
+```
+
+# Data quality checks
+
+```{r check_residence}
+## 0. Support tables -----------------------------------------------------------
+fix_prov <- function(x) case_when(
+  x == "BIO-BIO"   ~ "BIOBIO",
+  x == "AISEN"     ~ "AYSEN",
+  x == "COIHAIQUE" ~ "COYHAIQUE",
+  TRUE ~ x
+)
+
+# Path to the hospital master file
+master_file <- here::here(
+  "data",
+  "Tablas maestras bases GRD .xlsx"
+)
+
+# Confirm that the file exists
+stopifnot(file.exists(master_file))
+
+# Import hospital names
+hosp_names <- readxl::read_excel(
+  path = master_file,
+  sheet = "Hospitales",
+  skip = 1,
+  col_names = c("COD_HOSPITAL", "hospital")
+) %>%
+  mutate(COD_HOSPITAL = as.character(COD_HOSPITAL))
+
+# Municipality -> province according to INE (same file as the denominator)
+comuna_lookup <- ine %>%
+  distinct(`Nombre Comuna`, Provincia) %>%
+  transmute(
+    comuna_norm      = norm_nm(`Nombre Comuna`),
+    codigo_provincia = sprintf("%03d", as.integer(Provincia))
+  ) %>%
+  distinct() %>%
+  left_join(pop_prov %>% select(codigo_provincia, prov_from_comuna = provincia_norm),
+            by = "codigo_provincia")
+
+stopifnot(!any(duplicated(comuna_lookup$comuna_norm)))
+
+fix_comuna <- function(x) {
+  x <- str_replace_all(x, '"', "'")          # O"HIGGINS -> O'HIGGINS
+  case_when(
+    x == "COIHAIQUE" ~ "COYHAIQUE",
+    x == "CON CON"   ~ "CONCON",
+    x == "AISEN"     ~ "AYSEN",
+    TRUE ~ x
+  )
+}
+
+chk <- rates_data %>%
+  tibble::as_tibble() %>%
+  transmute(
+    COD_HOSPITAL,
+    comuna_norm   = fix_comuna(norm_nm(COMUNA)),
+    prov_declared = fix_prov(norm_nm(PROVINCIA))
+  ) %>%
+  left_join(comuna_lookup %>% select(comuna_norm, prov_from_comuna), by = "comuna_norm")
+
+## Check 1: patients by hospital ----------------------------------------------
+by_hosp <- chk %>%
+  group_by(COD_HOSPITAL) %>%
+  summarise(
+    episodes       = n(),
+    n_comunas      = n_distinct(comuna_norm),
+    n_provinces    = n_distinct(prov_declared),
+    top_prov_share = round(max(table(prov_declared)) / n(), 3),
+    .groups = "drop"
+  ) %>%
+  left_join(hosp_names, by = "COD_HOSPITAL") %>%
+  arrange(desc(episodes))
+
+cat("Hospitals:", nrow(by_hosp),
+    "| without name in master table:", sum(is.na(by_hosp$hospital)), "\n")
+cat("Hospitals with patients from a single province:", sum(by_hosp$n_provinces == 1), "\n\n")
+print(by_hosp %>% select(hospital, episodes, n_comunas, n_provinces, top_prov_share),
+      n = 20)
+
+## Check 2: declared province vs province derived from municipality ---------
+unmatched_com <- chk %>% filter(is.na(prov_from_comuna)) %>% count(comuna_norm, sort = TRUE)
+cat("\nEpisodes whose COMUNA is not found in the INE file:", sum(unmatched_com$n), "\n")
+print(unmatched_com, n = 30)
+
+matched <- chk %>% filter(!is.na(prov_from_comuna), prov_declared != "NUBLE")
+cat("\nAgreement PROVINCIA vs province derived from COMUNA:",
+    round(100 * mean(matched$prov_declared == matched$prov_from_comuna), 1), "%\n")
+
+matched %>%
+  filter(prov_declared != prov_from_comuna) %>%
+  count(prov_declared, prov_from_comuna, sort = TRUE) %>%
+  print(n = 20)
+
+## "NUBLE" episodes: which province does their municipality belong to? -------
+cat("\nFormer 'NUBLE' episodes by province derived from COMUNA:\n")
+chk %>%
+  filter(prov_declared == "NUBLE") %>%
+  count(prov_from_comuna, sort = TRUE) %>%
+  print()
+```
+```{r check_hospitals, echo=FALSE, message=FALSE, warning=FALSE}
+## Hospitals reporting COPD episodes by year ---------------------------------
+hosp_year <- copd_data %>%
+  tibble::as_tibble() %>%
+  mutate(
+    year         = lubridate::year(fecha_ingreso_dt),
+    COD_HOSPITAL = as.character(COD_HOSPITAL)
+  )
+
+## 1. Number of hospitals and episodes by year
+hosp_year %>%
+  group_by(year) %>%
+  summarise(
+    hospitals = n_distinct(COD_HOSPITAL),
+    episodes  = n(),
+    .groups   = "drop"
+  ) %>%
+  print()
+
+cat("Hospitals with at least one episode in 2019-2024:",
+    n_distinct(hosp_year$COD_HOSPITAL), "\n")
+
+## 2. Hospitals present in all years vs only some
+presence <- hosp_year %>%
+  distinct(COD_HOSPITAL, year) %>%
+  group_by(COD_HOSPITAL) %>%
+  summarise(
+    n_years    = n(),
+    first_year = min(year),
+    last_year  = max(year),
+    .groups    = "drop"
+  )
+
+presence %>% count(n_years, name = "hospitals") %>% print()
+
+## 3. Hospitals entering or leaving during the period
+changes <- presence %>%
+  filter(n_years < 6) %>%
+  left_join(
+    hosp_year %>% count(COD_HOSPITAL, name = "episodes"),
+    by = "COD_HOSPITAL"
+  ) %>%
+  arrange(first_year, desc(episodes))
+
+## 4. Hospital names, if hosp_names exists (chunk check_residence)
+if (exists("hosp_names")) {
+  changes <- changes %>% left_join(hosp_names, by = "COD_HOSPITAL")
+}
+print(changes, n = Inf)
+
+## 5. Share of those hospitals in the total number of episodes
+cat("Episodes in hospitals not present in all years:",
+    sum(changes$episodes), "of", nrow(hosp_year),
+    sprintf("(%.1f%%)\n", 100 * sum(changes$episodes) / nrow(hosp_year)))
+```
+```{r rates_stable_network, echo=FALSE, message=FALSE, warning=FALSE}
+## Annual national rate restricted to hospitals reporting in all 6 years -------
+hosp_cases <- rates_source %>%
+  tibble::as_tibble() %>%
+  transmute(
+    year         = lubridate::year(fecha_ingreso_dt),
+    COD_HOSPITAL = as.character(COD_HOSPITAL)
+  )
+
+# Must match the rate numerator
+stopifnot(nrow(hosp_cases) == nrow(cases))
+
+stable_hosp <- hosp_cases %>%
+  distinct(COD_HOSPITAL, year) %>%
+  count(COD_HOSPITAL, name = "n_years") %>%
+  filter(n_years == 6) %>%
+  pull(COD_HOSPITAL)
+
+cat("Hospitals reporting in all 6 years (rates numerator):", length(stable_hosp), "\n")
+
+rates_compare <- bind_rows(
+  hosp_cases %>% mutate(network = "All hospitals"),
+  hosp_cases %>% filter(COD_HOSPITAL %in% stable_hosp) %>% mutate(network = "Stable network")
+) %>%
+  count(network, year, name = "cases") %>%
+  left_join(pop_year, by = "year") %>%
+  add_rate() %>%
+  group_by(network) %>%
+  mutate(change_vs_2019 = 100 * (rate / rate[year == 2019] - 1)) %>%
+  ungroup()
+
+rates_compare %>%
+  mutate(
+    rate_ci        = lancet_ci(rate, lo, hi, 1),
+    change_vs_2019 = lancet_num(change_vs_2019, 1)
+  ) %>%
+  select(network, year, cases, rate_ci, change_vs_2019) %>%
+  print(n = Inf)
+```
+# Session information
+
+```{r session_info, echo=TRUE}
+sessionInfo()
+```
