@@ -1,27 +1,26 @@
 # Data
 
-The data files are **not included** in this repository. They can be obtained in two ways.
+The data files are **not included** in this repository.
 
-## Option A: request the consolidated dataset from CADS (recommended)
+## Analytic dataset
 
-The consolidated analytic dataset (`consolidated_data_COPD.rds`) is available from the Center for Health Data Observation and Analysis (CADS), Vice-Rectorate for Research, Universidad Mayor, Santiago, Chile, upon reasonable request and in accordance with its data access protocol.
+The consolidated analytic dataset (`consolidated_data_COPD.rds`) is available from the Center for Health Data Observation and Analysis (CADS), Vice-Rectorate for Research, Universidad Mayor, Santiago, Chile, upon reasonable request and in accordance with its data access protocol (https://www.umayor.cl/um/cads).
 
-To request the data: cads@umayor.cl.
+To request the data, contact cads@umayor.cl.
 
-With this file, only the files marked with an asterisk (*) in the table below are additionally needed to run `paper_copd_LRH.Rmd`.
+## Source data
 
-## Option B: rebuild the dataset from the public DRG databases
+The dataset was derived from the annual DRG discharge databases of the Chilean National Health Fund (FONASA) for 2019–2024, which are publicly available from the FONASA DRG dashboard: https://public.tableau.com/views/PropuestaTableroGRD/PropuestaTableroGRD
 
-The annual DRG discharge databases of the Chilean National Health Fund (FONASA) are publicly available from the FONASA DRG dashboard: https://public.tableau.com/views/PropuestaTableroGRD/PropuestaTableroGRD
-
+It includes all discharge episodes with a principal diagnosis of COPD (ICD-10 J44.0, J44.1, J44.8, or J44.9), with diagnoses, procedures, and an anonymised patient identifier linking episodes from the same patient. Exclusions by study period, age, sex, province, insurance, and length of stay are applied in `paper_copd_LRH.Rmd`.
 
 ## Required files
 
-The analysis requires the following files in this folder. They are not included in the repository.
+Place the following files in this folder:
 
-| File name (as read by the code) | Content | Source |
+| File name (exact) | Content | Source |
 |---|---|---|
-| `consolidated_data_COPD.rds` | FONASA DRG discharge episodes with a principal diagnosis of COPD (ICD-10 J44), 2019–2024 | FONASA, https://public.tableau.com/views/PropuestaTableroGRD/PropuestaTableroGRD |
+| `consolidated_data_COPD.rds` | COPD discharge episodes (principal diagnosis J44.0, J44.1, J44.8, or J44.9), 2019–2024 | CADS, upon request (derived from the FONASA DRG databases) |
 | `Norma MINSAL 2014_definitivo.xlsx` | 2014 MINSAL length-of-stay reference standard by DRG (sheet "PC IRGRD incluidos") | Chilean Ministry of Health (MINSAL) |
 | `Tablas maestras bases GRD .xlsx` | FONASA DRG master tables (sheet "Hospitales": hospital codes and names) | FONASA |
 | `estimaciones-y-proyecciones-2002-2035-comunas.xlsx` | Population estimates and projections by municipality, sex, and age, 2002–2035 | Chilean National Statistics Institute (INE), www.ine.gob.cl |
