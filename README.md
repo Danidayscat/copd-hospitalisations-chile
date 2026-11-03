@@ -1,6 +1,6 @@
 # In-hospital mortality and geographical variation in COPD hospitalisations in Chile, 2019–2024
 
-[![DOI](https://zenodo.org/badge/DOI/[CONCEPT-DOI].svg)](https://doi.org/[CONCEPT-DOI])
+[[![DOI](https://zenodo.org/badge/DOI/[CONCEPT-DOI].svg)](https://doi.org/[CONCEPT-DOI])](https://doi.org/10.5281/zenodo.23923781)
 
 Analysis code for the article:
 
